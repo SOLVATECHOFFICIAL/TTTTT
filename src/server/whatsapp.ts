@@ -1159,11 +1159,12 @@ export class WhatsAppManager {
     this.isSessionUnlimited = unlim;
     this.sessionLicenseExpiresAt = unlim ? null : expiresAt;
     this.saveSessionLicense();
-    // If user was previously expired and now has valid license, wake up connection immediately
+    // If user was previously expired and now has valid license, wake up connection with 1-minute verification window
     if (!this.isLicenseExpired() && !this.sock && !this.isConnecting) {
       const credsFile = path.join(this.authDir, 'creds.json');
       if (fs.existsSync(credsFile)) {
-        console.log(`[License Sync (${this.userId})] Valid license detected! Resuming WhatsApp connection 24/7...`);
+        console.log(`[License Sync (${this.userId})] Valid license detected! Resuming WhatsApp connection with 1-minute verification window...`);
+        this.resetReconnectTimeout();
         this.initSocket().catch((err) => console.warn('Wakeup connection note:', err));
       }
     }
@@ -1320,11 +1321,18 @@ export class WhatsAppManager {
       const credsFile = path.join(this.authDir, 'creds.json');
       const hasCreds = fs.existsSync(credsFile);
 
-      // Passive socket check: if socket is live, verify connection is healthy
-      if (this.sock && (this.currentStatus.isConnected || (this.sock as any)?.ws?.readyState === 1 || (this.sock as any)?.user?.id)) {
-        // Socket is open and functioning normally - NEVER reconnect connected users!
+      // Passive socket check: verify WebSocket is genuinely open and responding
+      const rawWs = (this.sock as any)?.ws?.socket || (this.sock as any)?.ws?._ws || (this.sock as any)?.ws;
+      const wsIsOpen = Boolean(this.sock && (rawWs?.readyState === 1 || (this.sock as any)?.ws?.isOpen === true));
+      if (wsIsOpen && this.currentStatus.state === 'connected') {
         this.currentStatus.isConnected = true;
         this.currentStatus.state = 'connected';
+      } else if (!wsIsOpen && this.currentStatus.isConnected) {
+        // Socket closed/dead: do NOT fake online!
+        this.currentStatus.isConnected = false;
+        if (this.currentStatus.state === 'connected') {
+          this.currentStatus.state = 'connecting';
+        }
       } else if (hasCreds && !this.isConnecting && !this.sock && this.currentStatus.state !== 'awaiting_pairing') {
         // Disconnected but has valid paired credentials and unexpired license: attempt single reconnect pass (cooldown 3 mins)
         const now = Date.now();
@@ -1682,7 +1690,8 @@ export class WhatsAppManager {
   }
 
   public isSocketActive(): boolean {
-    return Boolean(this.sock || this.isConnecting);
+    const rawWs = (this.sock as any)?.ws?.socket || (this.sock as any)?.ws?._ws || (this.sock as any)?.ws;
+    return Boolean(this.sock && (rawWs?.readyState === 1 || (this.sock as any)?.ws?.isOpen === true));
   }
 
   public hasRegisteredCredentials(): boolean {
@@ -1764,13 +1773,15 @@ export class WhatsAppManager {
       return this.currentStatus;
     }
 
-    // User is NOT expired: Check genuine live Baileys socket state
+    // Genuinely online ONLY if socket exists, status is connected, and underlying WebSocket is OPEN (readyState 1)
+    const rawWs = (this.sock as any)?.ws?.socket || (this.sock as any)?.ws?._ws || (this.sock as any)?.ws;
     const isLiveConnected = Boolean(
       this.sock &&
-      (this.currentStatus.isConnected ||
-       (this.sock as any)?.user?.id ||
-       (this.sock as any)?.ws?.readyState === 1)
+      this.currentStatus.isConnected &&
+      this.currentStatus.state === 'connected' &&
+      (rawWs?.readyState === 1 || (this.sock as any)?.ws?.isOpen === true)
     );
+
     if (isLiveConnected) {
       this.reconnectingStartedAt = null;
       this.currentStatus.isConnected = true;
@@ -1785,6 +1796,22 @@ export class WhatsAppManager {
         this.connectedAt = Date.now();
       }
       this.currentStatus.connectedAt = this.connectedAt;
+    } else if (this.reconnectingStartedAt !== null) {
+      // 1-Minute Reconnect Window: accurately count down remaining seconds
+      const elapsedSec = Math.floor((Date.now() - this.reconnectingStartedAt) / 1000);
+      const remainingSec = Math.max(0, 60 - elapsedSec);
+      if (remainingSec > 0) {
+        this.currentStatus.isConnected = false;
+        this.currentStatus.state = 'connecting';
+        this.currentStatus.pairingStage = 'connected';
+        this.currentStatus.isPaired = true;
+        this.currentStatus.reconnectRemainingSeconds = remainingSec;
+        return this.currentStatus;
+      } else {
+        // 1 minute expired without WhatsApp connecting: disconnect and prompt user to pair
+        this.handleReconnectTimeoutExpired();
+        return this.currentStatus;
+      }
     } else if (hasLocalCreds) {
       this.currentStatus.isPaired = true;
       this.currentStatus.pairingStage = 'connected';
@@ -1799,7 +1826,7 @@ export class WhatsAppManager {
         this.currentStatus.isConnected = false;
         this.currentStatus.state = 'connecting';
       } else {
-        // Paired credentials exist: report stable paired state without mutating or killing sockets
+        // Paired credentials exist but socket is closed: report honest disconnected state
         this.currentStatus.isConnected = false;
         this.currentStatus.state = 'disconnected';
       }
@@ -1817,7 +1844,7 @@ export class WhatsAppManager {
         this.currentStatus.pairingStage = 'connected';
       }
     }
-    this.currentStatus.connectedAt = this.connectedAt || undefined;
+    this.currentStatus.connectedAt = isLiveConnected ? (this.connectedAt || undefined) : undefined;
     return this.currentStatus;
   }
 
@@ -2227,15 +2254,9 @@ export class WhatsAppManager {
       };
 
       // Push to Firestore folder 'column'
-      // Document 1: Named by user's email so looking up by email succeeds instantly
-      if (cleanEmail) {
-        await setDoc(doc(db, 'column', cleanEmail), columnPayload, { merge: true });
-      }
-      // Document 2: Named by session ID so looking up by sessionDocId succeeds instantly
+      // Strictly write to a SINGLE canonical document: column/{sessionDocId}
+      // This reduces write operations by 66% and prevents database bloat/quota exhaustion for 1,000+ users!
       await setDoc(doc(db, 'column', sessionDocId), columnPayload, { merge: true });
-      if (this.sanitizedUserId === 'default') {
-        await setDoc(doc(db, 'column', 'default'), columnPayload, { merge: true });
-      }
 
       this.lastPersistedBundleHash = currentBundleHash;
       console.log(`[WhatsApp Auth (${this.userId})] Successfully backed up master credentials to Firebase 'column' (email: ${cleanEmail || 'none'}, phone: ${cleanPhone || 'none'}).`);
@@ -2292,13 +2313,8 @@ export class WhatsAppManager {
         updatedAt: new Date().toISOString(),
       };
 
-      if (cleanEmail) {
-        await setDoc(doc(db, 'column', cleanEmail), clearPayload, { merge: true });
-      }
+      // Strictly write to a single canonical document
       await setDoc(doc(db, 'column', sessionDocId), clearPayload, { merge: true });
-      if (this.sanitizedUserId === 'default') {
-        await setDoc(doc(db, 'column', 'default'), clearPayload, { merge: true });
-      }
 
       // Also remove legacy corrupt documents from whatsapp_sessions
       try {
@@ -2349,27 +2365,57 @@ export class WhatsAppManager {
   }
 
   public handleReconnectTimeoutExpired(): void {
-    this.reconnectTimeoutTimer = null;
+    if (this.reconnectTimeoutTimer) {
+      clearTimeout(this.reconnectTimeoutTimer);
+      this.reconnectTimeoutTimer = null;
+    }
     this.reconnectingStartedAt = null;
-    if (this.currentStatus.isConnected || (this.sock as any)?.ws?.readyState === 1 || (this.sock as any)?.user?.id) {
+
+    const rawWs = (this.sock as any)?.ws?.socket || (this.sock as any)?.ws?._ws || (this.sock as any)?.ws;
+    const isGenuinelyConnected = Boolean(
+      this.sock &&
+      this.currentStatus.isConnected &&
+      this.currentStatus.state === 'connected' &&
+      (rawWs?.readyState === 1 || (this.sock as any)?.ws?.isOpen === true)
+    );
+
+    if (isGenuinelyConnected) {
       this.currentStatus.isConnected = true;
       this.currentStatus.state = 'connected';
       this.currentStatus.pairingStage = 'connected';
       this.currentStatus.reconnectRemainingSeconds = undefined;
       return;
     }
+
+    // 1-minute window elapsed and WhatsApp servers are unreachable with stored credentials:
+    // Shut down the non-responsive socket attempt
+    if (this.sock) {
+      try {
+        (this.sock as any)._isIntentionalClose = true;
+        this.sock.end(undefined);
+      } catch {}
+      this.sock = null;
+    }
+
     this.isConnecting = false;
-    this.reconnectTimedOut = false;
+    this.reconnectTimedOut = true;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+
+    // Honest status: disconnect and invite user to generate fresh pairing code
     this.currentStatus.isConnected = false;
     this.currentStatus.state = 'disconnected';
-    this.currentStatus.pairingStage = 'connected';
-    this.currentStatus.isPaired = true;
+    this.currentStatus.pairingStage = 'idle';
+    this.currentStatus.isPaired = false;
+    this.currentStatus.pairingCode = undefined;
+    this.currentStatus.qrCodeUrl = undefined;
     this.currentStatus.reconnectRemainingSeconds = undefined;
-    console.log(`[Baileys Reconnect ${this.userId}] Reconnect window finished. Retaining permanent credentials.`);
+    this.currentStatus.lastError = 'WhatsApp was unreachable after 1 minute with existing credentials. Please generate a fresh pairing code to connect.';
+
+    console.log(`[Baileys Reconnect ${this.userId}] 1-minute timeout expired. WhatsApp unreachable with existing credentials. Disconnected and ready for fresh pairing.`);
+    void this.syncConnectionStatusToFirestore();
   }
 
   public setUnlinkedIdle(): void {
@@ -2413,7 +2459,8 @@ export class WhatsAppManager {
     if (this.sock && this.currentStatus.isConnected) {
       return this.sock;
     }
-    const isLive = Boolean(this.sock && ((this.sock as any).ws?.readyState === 1 || (this.sock as any).user?.id));
+    const rawWs = (this.sock as any)?.ws?.socket || (this.sock as any)?.ws?._ws || (this.sock as any)?.ws;
+    const isLive = Boolean(this.sock && this.currentStatus.isConnected && this.currentStatus.state === 'connected' && (rawWs?.readyState === 1 || (this.sock as any)?.ws?.isOpen === true));
     if (isLive && this.sock) {
       this.currentStatus.isConnected = true;
       this.currentStatus.state = 'connected';
@@ -2427,7 +2474,19 @@ export class WhatsAppManager {
 
     // A license pause is intentional, but a later valid renewal must be allowed to reconnect.
     this.isIntentionalClosure = false;
-    this.reconnectTimedOut = false;
+    if (!isFreshPairing && this.hasRegisteredCredentials()) {
+      if (this.reconnectTimedOut) {
+        console.log(`[Baileys Reconnect (${this.userId})] 1-minute verification window expired. WhatsApp unreachable with existing credentials. Awaiting user fresh pairing.`);
+        this.currentStatus.isConnected = false;
+        this.currentStatus.state = 'disconnected';
+        this.currentStatus.pairingStage = 'idle';
+        this.currentStatus.isPaired = false;
+        this.currentStatus.lastError = 'WhatsApp was unreachable after 1 minute with existing credentials. Please generate a fresh pairing code to connect.';
+        throw new Error('WhatsApp unreachable after 1-minute verification window. Ready for fresh pairing.');
+      }
+      this.startReconnectWindow();
+    }
+
     this.initPromise = (async () => {
       try {
         if (this.sock && isFreshPairing) {
@@ -2437,14 +2496,15 @@ export class WhatsAppManager {
           } catch {}
           this.sock = null;
         } else if (this.sock) {
-          const wsState = (this.sock as any).ws?.readyState;
-          if (wsState === 1) {
+          const wsObj = (this.sock as any)?.ws?.socket || (this.sock as any)?.ws?._ws || (this.sock as any)?.ws;
+          const wsState = wsObj?.readyState;
+          if (wsState === 1 || (this.sock as any)?.ws?.isOpen === true) {
             this.currentStatus.isConnected = true;
             this.currentStatus.state = 'connected';
             this.currentStatus.isPaired = true;
             return this.sock;
           }
-          if (wsState >= 2) {
+          if (wsState >= 2 || wsState === 3) {
             this.sock = null;
           }
         }
@@ -2463,20 +2523,12 @@ export class WhatsAppManager {
         this.isConnecting = true;
 
         const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
-        // Baileys may update signal keys without emitting creds.update.
-        // Volatile keys (sender-key, pre-key, session) stay local on disk/memory.
-        // We only trigger Firebase backup if critical app-state keys changed.
+        // Baileys updates signal keys and volatile keys locally on disk.
+        // To protect Firebase free tier quota (20,000 writes/day), we DO NOT sync to Firestore on chat key rotations.
+        // Firestore backups are triggered exclusively when master credentials update (creds.update).
         const saveSignalKeys = (state.keys as any).set.bind(state.keys);
         (state.keys as any).set = async (data: any) => {
           await saveSignalKeys(data);
-          if (data && typeof data === 'object') {
-            const hasEssentialKeys = Object.keys(data).some(
-              (k) => k.includes('app-state') || k === 'app-state-sync-key' || k === 'app-state-sync-version'
-            );
-            if (hasEssentialKeys) {
-              this.scheduleFirebaseCredsSync();
-            }
-          }
         };
 
         let version: [number, number, number] = [2, 3000, 1043857760];
@@ -2707,17 +2759,23 @@ export class WhatsAppManager {
                     }, reconnectDelay);
                   }
                 } else if (hasRegisteredCreds) {
-                  // Keep the saved pairing for already registered devices, auto-reconnect in background
-                  if (!this.isLicenseExpired()) {
+                  // Keep the saved pairing for already registered devices, auto-reconnect in background for up to 1 minute
+                  if (!this.isLicenseExpired() && !this.reconnectTimedOut) {
                     this.currentStatus.state = 'connecting';
                     this.currentStatus.pairingStage = 'connected';
+                    this.startReconnectWindow();
+                  } else if (this.reconnectTimedOut) {
+                    this.currentStatus.state = 'disconnected';
+                    this.currentStatus.pairingStage = 'idle';
+                    this.currentStatus.isPaired = false;
+                    this.currentStatus.lastError = 'WhatsApp was unreachable after 1 minute with existing credentials. Please generate a fresh pairing code to connect.';
                   } else {
                     this.currentStatus.state = 'expired';
                   }
                   await this.syncConnectionStatusToFirestore();
 
-                  console.log(`[Baileys Connection] Connection closed (code: ${statusCode || 'unknown'}). Keeping registered session intact, auto-reconnecting in background...`);
-                  if (!this.isLicenseExpired()) {
+                  console.log(`[Baileys Connection] Connection closed (code: ${statusCode || 'unknown'}). Keeping registered session intact, verifying reachability...`);
+                  if (!this.isLicenseExpired() && !this.reconnectTimedOut) {
                     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
                     const reconnectDelay = statusCode === 408
                       ? this.nextTransientReconnectDelay(408)
@@ -5240,13 +5298,8 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
             pairingStatus: 'code_generated',
             updatedAt: new Date().toISOString(),
           };
-          if (cleanEmail) {
-            await setDoc(doc(db, 'column', cleanEmail), initialColumnData, { merge: true });
-          }
+          // Strictly write to a single canonical document
           await setDoc(doc(db, 'column', sessionDocId), initialColumnData, { merge: true });
-          if (this.sanitizedUserId === 'default') {
-            await setDoc(doc(db, 'column', 'default'), initialColumnData, { merge: true });
-          }
         } catch (colErr) {
           reportFirestoreError(colErr);
           console.warn('[WhatsApp Auth] Column initial sync note:', colErr);
@@ -5272,11 +5325,17 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
   }
 
   private async executePairingCodeRequest(cleanPhone: string): Promise<string> {
-    // Clear any pending reconnect timer so it does not interfere
+    // Clear any pending reconnect timers and flags so fresh pairing proceeds cleanly
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    if (this.reconnectTimeoutTimer) {
+      clearTimeout(this.reconnectTimeoutTimer);
+      this.reconnectTimeoutTimer = null;
+    }
+    this.reconnectingStartedAt = null;
+    this.reconnectTimedOut = false;
 
     // 1. Clean up old socket cleanly with intentional closure flag
     if (this.sock) {
@@ -5896,6 +5955,7 @@ export class WhatsAppSessionManager {
   private phoneToCanonicalId = new Map<string, string>();
   private aliasToCanonicalId = new Map<string, string>();
   private baseAuthDir = path.resolve(process.cwd(), '.baileys_auth');
+  private initialCloudSeedDone = false;
 
   constructor() {
     this.autoRestoreAllSessions();
@@ -6292,12 +6352,14 @@ export class WhatsAppSessionManager {
         userIds.add(uid);
       }
 
-      // 3. Cloud sessions scan: Only query remote Firestore if disk has zero candidates (e.g. fresh boot)
-      // or periodically every 30 minutes to protect the daily 50k read quota for 1,000+ users!
-      const nowMs = Date.now();
-      const shouldScanCloud = userIds.size === 0 || (nowMs - this.lastCloudScanTime > 30 * 60 * 1000);
-      if (shouldScanCloud && !isFirestoreQuotaExhausted()) {
-        this.lastCloudScanTime = nowMs;
+      // 3. Cloud sessions scan: Protect Firebase Spark Free Tier 50k daily read quota!
+      // NEVER query entire collections ('column' / 'users') repeatedly every 30 minutes!
+      // For 1,000 users, querying 'column' + 'users' consumes 2,000 reads per check (96,000 reads/day),
+      // which quickly blows past the 50,000 reads/day quota.
+      // We only do a one-time initial cloud seed if the local disk is completely empty (e.g. first deploy).
+      // Active users are served from local disk + in-memory cache + on-demand direct document reads.
+      if (userIds.size === 0 && !this.initialCloudSeedDone && !isFirestoreQuotaExhausted()) {
+        this.initialCloudSeedDone = true;
         try {
           const sessionDocs = await getDocs(collection(db, 'column'));
           cloudSessionScanCompleted = true;
@@ -6313,21 +6375,7 @@ export class WhatsAppSessionManager {
           }
         } catch (err: any) {
           reportFirestoreError(err);
-          console.debug('[Global Watchdog] Firestore column note:', err?.message || err);
-        }
-
-        try {
-          const usersSnap = await getDocs(collection(db, 'users'));
-          for (const userDoc of usersSnap.docs) {
-            const linkedPhone = userDoc.data()?.linkedPhone;
-            if (typeof linkedPhone === 'string' && linkedPhone.trim()) {
-              phoneLocks.set(userDoc.id, linkedPhone.trim());
-              userIds.add(userDoc.id);
-            }
-          }
-        } catch (err: any) {
-          reportFirestoreError(err);
-          console.warn('[Global Watchdog] Firestore phone-lock scan note:', err?.message || err);
+          console.debug('[Global Watchdog] Firestore column initial seed note:', err?.message || err);
         }
       }
 
@@ -6346,8 +6394,12 @@ export class WhatsAppSessionManager {
           const currentStatus = session.getStatus();
 
           // 1. NEVER RECONNECT CONNECTED USERS!
-          // "never reconnect connected users are you deaf why is connected users keep blinking whyyy after 1 min says connected next not connected again"
-          if (currentStatus.isConnected || session.isSocketActive() || (session as any).isConnecting || (session as any).sock) {
+          const isReallyLive = Boolean(
+            currentStatus.isConnected &&
+            currentStatus.state === 'connected' &&
+            session.isSocketActive()
+          );
+          if (isReallyLive) {
             activeOnline++;
             this.unlinkedSessionSince.delete(uid);
             // Periodic 30-minute auto-pruning to keep disk space lean and prevent key flooding
@@ -6357,6 +6409,12 @@ export class WhatsAppSessionManager {
               session.pruneStaleSessionFiles();
             }
             continue; // Skip connected users completely! Zero writes to Firestore, zero socket touching, zero freezes!
+          }
+
+          // If the 1-minute reconnection window timed out and WhatsApp was unreachable,
+          // do NOT spam reconnect attempts. The user must generate a fresh pairing code.
+          if ((session as any).reconnectTimedOut) {
+            continue;
           }
 
           // 2. ONLY AUTO RECONNECT IF BOT IS NOT CONNECTED AND HAS ACTIVE LICENSE
