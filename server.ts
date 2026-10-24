@@ -199,6 +199,63 @@ async function startServer() {
     return sessionManager.getSession(userId, userEmail);
   };
 
+  const verifyFirebaseUserForReq = async (
+    req: express.Request,
+    res: express.Response,
+  ): Promise<{ uid: string; email?: string } | null> => {
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.setHeader('Vary', 'Authorization');
+    const match = /^Bearer\s+([^\s]+)$/i.exec(req.header('authorization') || '');
+    const idToken = match?.[1];
+    if (!firebaseConfig.apiKey) {
+      res.status(503).json({ success: false, error: 'Firebase authentication is not configured.' });
+      return null;
+    }
+    if (!idToken || idToken.length > 8192) {
+      res.status(401).json({ success: false, error: 'Sign in to export group contacts.' });
+      return null;
+    }
+
+    try {
+      const response = await fetch(
+        `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ idToken }),
+          signal: AbortSignal.timeout(6000),
+        },
+      );
+      if (!response.ok) {
+        res.status(401).json({ success: false, error: 'Your sign-in expired. Please sign in again.' });
+        return null;
+      }
+
+      const identity = await response.json() as {
+        users?: Array<{ localId?: string; email?: string }>;
+      };
+      const account = identity.users?.[0];
+      if (!account?.localId) {
+        res.status(401).json({ success: false, error: 'Could not verify your signed-in account.' });
+        return null;
+      }
+
+      const requestedUserId =
+        (req.query.userId as string) ||
+        (req.headers['x-user-id'] as string) ||
+        '';
+      if (!requestedUserId || requestedUserId !== account.localId) {
+        res.status(403).json({ success: false, error: 'You can only export contacts from your own linked account.' });
+        return null;
+      }
+      return { uid: account.localId, email: account.email };
+    } catch (err) {
+      console.warn('Firebase contact-export identity lookup failed:', err);
+      res.status(503).json({ success: false, error: 'Could not verify your account right now. Please retry.' });
+      return null;
+    }
+  };
+
   // Serve solva.webp from root folder or public folder
   app.get('/solva.webp', (_req, res) => {
     const rootPath = path.resolve(__dirname, 'solva.webp');
@@ -934,6 +991,22 @@ async function startServer() {
     });
   });
 
+  app.get('/api/whatsapp/health', async (req, res) => {
+    const userId = (req.query.userId as string) || (req.headers['x-user-id'] as string) || '';
+    if (!userId) {
+      return res.status(400).json({ success: false, error: 'User ID is required.' });
+    }
+    res.setHeader('Cache-Control', 'private, no-store');
+    try {
+      const session = getSessionForReq(req);
+      await session.ensureRestored();
+      return res.json({ success: true, health: await session.getHealthSnapshot() });
+    } catch (err: any) {
+      console.error('WhatsApp health check failed:', err);
+      return res.status(500).json({ success: false, error: 'Could not read WhatsApp socket health.' });
+    }
+  });
+
   app.get('/api/whatsapp/notifications', (req, res) => {
     const userId = (req.query.userId as string) || (req.headers['x-user-id'] as string) || '';
     if (!userId) {
@@ -1174,6 +1247,29 @@ async function startServer() {
       return res.status(404).json({ success: false, error: 'No group picture available' });
     } catch (err: any) {
       return res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  app.get('/api/groups/:gid/contacts', async (req, res) => {
+    const identity = await verifyFirebaseUserForReq(req, res);
+    if (!identity) return;
+
+    try {
+      const session = sessionManager.getSession(identity.uid, identity.email || '');
+      const status = session.getStatus();
+      if (!status.isConnected) {
+        return res.status(409).json({ success: false, error: 'Connect your WhatsApp account before exporting contacts.' });
+      }
+
+      const exportData = await session.getGroupContactExport(req.params.gid);
+      return res.json({ success: true, ...exportData });
+    } catch (err: any) {
+      const status = Number(err?.status) || 500;
+      if (status >= 500) console.error('Group contact export failed:', err);
+      return res.status(status).json({
+        success: false,
+        error: err?.message || 'Could not export contacts for this group.',
+      });
     }
   });
 

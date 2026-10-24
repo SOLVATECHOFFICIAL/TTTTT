@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
+import type { User } from 'firebase/auth';
 import {
   Shield,
   Users,
@@ -21,6 +22,7 @@ import {
   Smartphone,
   QrCode,
   Image as ImageIcon,
+  Download,
 } from 'lucide-react';
 import { safeParseJson } from '../App';
 import { WhatsAppNotification } from './NotificationsPanel';
@@ -54,6 +56,7 @@ interface GroupAdminPanelProps {
   isLicenseExpired?: boolean;
   targetPhone?: string;
   userId?: string;
+  currentUser?: User | null;
   onShowToast?: (notification: WhatsAppNotification) => void;
   onGoToPair?: () => void;
 }
@@ -133,6 +136,7 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
   isLicenseExpired = false,
   targetPhone,
   userId,
+  currentUser,
   onShowToast,
   onGoToPair,
 }) => {
@@ -141,6 +145,7 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
   const [syncing, setSyncing] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [exportingKey, setExportingKey] = useState<string | null>(null);
   const [pendingToggles, setPendingToggles] = useState<Record<string, boolean>>({});
   const [groupSyncWarning, setGroupSyncWarning] = useState<string | null>(null);
   const groupsRequestInFlight = useRef(false);
@@ -402,6 +407,96 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
     navigator.clipboard.writeText(jid);
     setCopiedId(jid);
     setTimeout(() => setCopiedId(null), 2500);
+  };
+
+  const handleExportContacts = async (group: GroupItem, format: 'vcf' | 'csv') => {
+    if (!currentUser || !userId || !isConnected) {
+      onShowToast?.({
+        id: `group_export_unavailable_${Date.now()}`,
+        type: 'warning',
+        title: 'WhatsApp must be connected',
+        body: 'Connect the linked WhatsApp account to export this group.',
+        timestamp: new Date().toLocaleTimeString(),
+      });
+      return;
+    }
+
+    const exportKey = `${group.id}:${format}`;
+    setExportingKey(exportKey);
+    try {
+      const token = await currentUser.getIdToken();
+      const response = await fetch(
+        `/api/groups/${encodeURIComponent(group.id)}/contacts?userId=${encodeURIComponent(userId)}`,
+        { headers: { Authorization: `Bearer ${token}` }, cache: 'no-store' },
+      );
+      const data = await safeParseJson<{
+        success: boolean;
+        groupName?: string;
+        exportedCount?: number;
+        unavailableCount?: number;
+        contacts?: Array<{ name: string; phone: string }>;
+        error?: string;
+      }>(response);
+      if (!response.ok || !data?.success || !Array.isArray(data.contacts)) {
+        throw new Error(data?.error || 'The group contacts could not be exported.');
+      }
+      if (data.contacts.length === 0) {
+        throw new Error('WhatsApp did not provide any phone-number contacts for this group.');
+      }
+
+      const escapeVCard = (value: string) =>
+        value.replace(/\\/g, '\\\\').replace(/\r\n|\r|\n/g, '\\n').replace(/([;,])/g, '\\$1');
+      const escapeCsv = (value: string) => {
+        const safeValue = /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
+        return `"${safeValue.replace(/"/g, '""')}"`;
+      };
+      const fileContents = format === 'vcf'
+        ? data.contacts.map(({ name, phone }) => [
+            'BEGIN:VCARD',
+            'VERSION:3.0',
+            `FN:${escapeVCard(name || phone)}`,
+            `TEL;TYPE=CELL:+${phone}`,
+            'END:VCARD',
+          ].join('\r\n')).join('\r\n')
+        : [
+            'Name,Phone',
+            ...data.contacts.map(({ name, phone }) => `${escapeCsv(name)},${escapeCsv(`+${phone}`)}`),
+          ].join('\r\n');
+      const mimeType = format === 'vcf' ? 'text/vcard;charset=utf-8' : 'text/csv;charset=utf-8';
+      const blob = new Blob([format === 'csv' ? `\uFEFF${fileContents}` : fileContents], { type: mimeType });
+      const objectUrl = URL.createObjectURL(blob);
+      const filenameBase = (data.groupName || group.subject)
+        .normalize('NFKD')
+        .replace(/[^\w-]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 60) || 'whatsapp-group';
+      const anchor = document.createElement('a');
+      anchor.href = objectUrl;
+      anchor.download = `${filenameBase}-contacts.${format}`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+
+      const skipped = data.unavailableCount ? ` ${data.unavailableCount} member(s) had no exportable phone number.` : '';
+      onShowToast?.({
+        id: `group_export_${Date.now()}`,
+        type: 'system',
+        title: `Group contacts downloaded (${format.toUpperCase()})`,
+        body: `${data.exportedCount ?? data.contacts.length} contact(s) exported.${skipped}`,
+        timestamp: new Date().toLocaleTimeString(),
+      });
+    } catch (err: any) {
+      onShowToast?.({
+        id: `group_export_error_${Date.now()}`,
+        type: 'error',
+        title: 'Contact export failed',
+        body: err?.message || 'Could not download group contacts.',
+        timestamp: new Date().toLocaleTimeString(),
+      });
+    } finally {
+      setExportingKey(null);
+    }
   };
 
   // Filter groups — strictly admin-only groups
@@ -733,7 +828,7 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
                   </div>
 
                   {/* Quick Group Action Buttons */}
-                  <div className="flex items-center gap-2 shrink-0 self-end sm:self-auto">
+                  <div className="flex flex-wrap items-center justify-end gap-2 shrink-0 self-end sm:self-auto">
                     <button
                       type="button"
                       onClick={() => handleToggleAllForGroup(group.id, true)}
@@ -754,6 +849,32 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
                       className="px-3 py-1.5 rounded-xl text-xs font-semibold bg-slate-800 hover:bg-slate-700 active:scale-95 text-slate-300 border border-slate-700 transition-all cursor-pointer"
                     >
                       <span>All OFF</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleExportContacts(group, 'vcf')}
+                      disabled={!isConnected || !currentUser || exportingKey !== null}
+                      title="Download a vCard file for importing contacts"
+                      className="px-2.5 py-1.5 rounded-xl text-xs font-semibold bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-200 border border-cyan-500/30 transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <span className="inline-flex items-center gap-1">
+                        <Download className="w-3.5 h-3.5" />
+                        {exportingKey === `${group.id}:vcf` ? '...' : 'VCF'}
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleExportContacts(group, 'csv')}
+                      disabled={!isConnected || !currentUser || exportingKey !== null}
+                      title="Download a CSV spreadsheet of group contacts"
+                      className="px-2.5 py-1.5 rounded-xl text-xs font-semibold bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-200 border border-cyan-500/30 transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <span className="inline-flex items-center gap-1">
+                        <Download className="w-3.5 h-3.5" />
+                        {exportingKey === `${group.id}:csv` ? '...' : 'CSV'}
+                      </span>
                     </button>
                   </div>
                 </div>

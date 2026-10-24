@@ -51,6 +51,7 @@ import { AuthModal } from './components/AuthModal';
 import { UserAccountNav } from './components/UserAccountNav';
 import { AdminDashboard } from './components/AdminDashboard';
 import { GroupAdminPanel } from './components/GroupAdminPanel';
+import { SocketHealthRadar } from './components/SocketHealthRadar';
 import { LicenseCountdown } from './components/LicenseCountdown';
 import { PairingCountdown } from './components/PairingCountdown';
 import { PWAInstallButton } from './components/PWAInstallButton';
@@ -2604,16 +2605,20 @@ export default function App() {
 
           {/* TAB 2: MY GROUPS & ADMIN DEFENSE */}
           {activeTab === 'groups' && (
-            <GroupAdminPanel
-              isConnected={status.isConnected}
-              isPaired={Boolean(status.isPaired || status.user?.phone)}
-              isReconnecting={status.state === 'connecting'}
-              isLicenseExpired={status.state === 'expired' || !isLicenseActive}
-              targetPhone={status.user?.phone || status.targetPhone}
-              userId={currentUser?.uid}
-              onShowToast={setToastNotification}
-              onGoToPair={() => setActiveTab('pair')}
-            />
+            <div className="space-y-4">
+              <SocketHealthRadar user={currentUser} isConnected={status.isConnected} />
+              <GroupAdminPanel
+                isConnected={status.isConnected}
+                isPaired={Boolean(status.isPaired || status.user?.phone)}
+                isReconnecting={status.state === 'connecting'}
+                isLicenseExpired={status.state === 'expired' || !isLicenseActive}
+                targetPhone={status.user?.phone || status.targetPhone}
+                userId={currentUser?.uid}
+                currentUser={currentUser}
+                onShowToast={setToastNotification}
+                onGoToPair={() => setActiveTab('pair')}
+              />
+            </div>
           )}
 
           {/* TAB 3: LICENSE */}

@@ -30,6 +30,7 @@ export interface CommandContext {
   getGroupInviteCode?: (gid: string) => string | undefined;
   setGroupInviteCode?: (gid: string, code: string) => void;
   isGroupParticipantAdmin?: (gid: string, participantJid: string) => Promise<boolean>;
+  measureSocketLatency?: () => Promise<number | null>;
 }
 
 export const GROUP_ONLY_COMMANDS = new Set([
@@ -710,11 +711,13 @@ class CommandHandler {
     }
 
     if (cmd === 'ping') {
-      const latency = Date.now() - startTime + Math.floor(Math.random() * 15 + 8);
+      const socketLatency = await ctx.measureSocketLatency?.() ?? null;
+      const processingLatency = Math.max(0, Date.now() - startTime);
       return {
         reply: `⚡ *PONG!*
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⚡ *Latency:* *${latency}ms*
+🌐 *WhatsApp Socket RTT:* *${socketLatency === null ? 'Unavailable' : `${socketLatency.toFixed(1)}ms`}*
+⚙️ *Command Processing:* *${processingLatency}ms*
 🟢 *Status:* *ACTIVE & OPERATIONAL*
 🛡️ *Engine:* *SOLVATECH Multi-Device Engine*
 🌐 *Portal:* solvatech.up.railway.app
@@ -1289,7 +1292,7 @@ _${groupDesc}_
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ✅ *Sticker Extraction Active:*
 • Static Stickers: Converted back into full-resolution PNG photo.
-• Animated Stickers: Extracted back into MP4 video with full audio/video timing.
+• Animated Stickers: Exported as MP4 video with animation timing. WebP stickers do not contain audio.
 
 💡 *Usage:* Reply to any WhatsApp sticker with *.antisticker* to extract it back into original media!
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━`,

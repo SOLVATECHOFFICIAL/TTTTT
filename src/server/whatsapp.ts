@@ -17,10 +17,51 @@ import path from 'path';
 import { execSync, execFile } from 'child_process';
 import { promisify } from 'util';
 import { createHash } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import sharp from 'sharp';
 import webpmux from 'node-webpmux';
+import { TokenBucketRateLimiter } from './command-rate-limiter.ts';
 
 const execFileAsync = promisify(execFile);
+
+export async function measureWebSocketRoundTrip(
+  socket: any,
+  timeoutMs = 1000,
+): Promise<number | null> {
+  if (
+    !socket ||
+    socket.readyState !== 1 ||
+    typeof socket.ping !== 'function' ||
+    typeof socket.once !== 'function'
+  ) {
+    return null;
+  }
+
+  return new Promise((resolve) => {
+    const startedAt = performance.now();
+    let settled = false;
+    let timeout: NodeJS.Timeout;
+
+    const finish = (latency: number | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      socket.off?.('pong', onPong);
+      socket.removeListener?.('pong', onPong);
+      resolve(latency);
+    };
+    const onPong = () => finish(Math.max(0, performance.now() - startedAt));
+
+    socket.once('pong', onPong);
+    timeout = setTimeout(() => finish(null), timeoutMs);
+    try {
+      socket.ping();
+    } catch {
+      finish(null);
+    }
+  });
+}
+
 import { createWorker } from 'tesseract.js';
 import { commandHandler, parseSpamArgs, GROUP_ONLY_COMMANDS, ADMIN_ONLY_GROUP_COMMANDS } from './commands.ts';
 import { isFirestoreQuotaExhausted, reportFirestoreError } from '../services/firestore-status.ts';
@@ -609,6 +650,10 @@ export class WhatsAppManager {
   private pendingGreetings = new Map<string, { timer: NodeJS.Timeout; participants: Set<string>; action: 'add' | 'remove'; groupId: string }>();
   private mediaCache = new Map<string, string>();
   private consecutive401Count = 0;
+  private transientReconnectAttempt = 0;
+  private commandRateLimiter = new TokenBucketRateLimiter(5, 4);
+  private lastRateLimitNoticeAt = 0;
+  private socketProbePromise: Promise<number | null> | null = null;
   private recentAdminGroupCommands = new Map<string, {
     command: string;
     rawText: string;
@@ -1292,6 +1337,63 @@ export class WhatsAppManager {
         console.warn(`[24/7 Watchdog] Auto-reconnect note for ${this.userId}:`, err?.message);
       });
     }, 1500);
+  }
+
+  private nextTransientReconnectDelay(statusCode: number): number {
+    const baseDelay = statusCode === 515 || statusCode === DisconnectReason.restartRequired
+      ? 500
+      : 1000;
+    const exponent = Math.min(this.transientReconnectAttempt, 6);
+    this.transientReconnectAttempt += 1;
+    const exponentialDelay = Math.min(30_000, baseDelay * (2 ** exponent));
+    return Math.round(exponentialDelay * (0.9 + Math.random() * 0.2));
+  }
+
+  public getCommandRateLimiterTokens(): number {
+    return this.commandRateLimiter.getAvailableTokens();
+  }
+
+  public async measureSocketLatency(): Promise<number | null> {
+    if (!this.sock || !this.currentStatus.isConnected) return null;
+    if (this.socketProbePromise) return this.socketProbePromise;
+
+    const probe = measureWebSocketRoundTrip((this.sock as any).ws);
+    this.socketProbePromise = probe;
+    try {
+      return await probe;
+    } finally {
+      if (this.socketProbePromise === probe) this.socketProbePromise = null;
+    }
+  }
+
+  public async getHealthSnapshot(): Promise<{
+    state: string;
+    isConnected: boolean;
+    socketLatencyMs: number | null;
+    connectedAt: number | null;
+    uptimeSeconds: number;
+    commandTokens: number;
+    commandTokenCapacity: number;
+    commandRefillPerSecond: number;
+    batteryLevel: null;
+  }> {
+    const status = this.getStatus();
+    const isConnected = Boolean(status.isConnected && this.sock);
+    const connectedAt = isConnected ? this.connectedAt : null;
+    const socketLatencyMs = isConnected ? await this.measureSocketLatency() : null;
+
+    return {
+      state: status.state,
+      isConnected,
+      socketLatencyMs,
+      connectedAt,
+      uptimeSeconds: connectedAt ? Math.floor((Date.now() - connectedAt) / 1000) : 0,
+      commandTokens: this.commandRateLimiter.getAvailableTokens(),
+      commandTokenCapacity: this.commandRateLimiter.capacity,
+      commandRefillPerSecond: 4,
+      // Replit/Railway cloud runtimes do not expose the host's physical battery telemetry.
+      batteryLevel: null,
+    };
   }
 
   // Anti-Delete Recovery Handler: Recovers deleted text and media and delivers directly to personal WhatsApp DM
@@ -2567,13 +2669,15 @@ export class WhatsAppManager {
                   });
                   if (!this.isLicenseExpired()) {
                     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+                    const reconnectDelay = this.nextTransientReconnectDelay(Number(statusCode) || 515);
+                    console.log(`[Baileys Connection] Scheduling restartRequired retry in ${reconnectDelay}ms (attempt ${this.transientReconnectAttempt}).`);
                     this.reconnectTimer = setTimeout(async () => {
                       await this.credentialsSavePromise.catch(() => {});
                       await new Promise((r) => setTimeout(r, 400));
                       this.initSocket().catch((err) => {
                         console.warn('Auto-restart note:', err);
                       });
-                    }, 500);
+                    }, reconnectDelay);
                   }
                 } else if (hasRegisteredCreds) {
                   // Keep the saved pairing for already registered devices, auto-reconnect in background
@@ -2588,11 +2692,17 @@ export class WhatsAppManager {
                   console.log(`[Baileys Connection] Connection closed (code: ${statusCode || 'unknown'}). Keeping registered session intact, auto-reconnecting in background...`);
                   if (!this.isLicenseExpired()) {
                     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+                    const reconnectDelay = statusCode === 408
+                      ? this.nextTransientReconnectDelay(408)
+                      : 2000;
+                    if (statusCode === 408) {
+                      console.log(`[Baileys Connection] Scheduling 408 retry in ${reconnectDelay}ms (attempt ${this.transientReconnectAttempt}).`);
+                    }
                     this.reconnectTimer = setTimeout(() => {
                       this.initSocket().catch((err) => {
                         console.warn('Auto-reconnect note:', err);
                       });
-                    }, 2000);
+                    }, reconnectDelay);
                   }
                 } else {
                   // Connection closed while awaiting pairing code entry or idle.
@@ -2614,6 +2724,7 @@ export class WhatsAppManager {
               this.reconnectTimedOut = false;
               this.currentStatus.reconnectRemainingSeconds = undefined;
               this.connectedAt = Date.now();
+              this.transientReconnectAttempt = 0;
               this.currentStatus.state = 'connected';
               this.currentStatus.isConnected = true;
               this.consecutive401Count = 0;
@@ -3344,6 +3455,19 @@ export class WhatsAppManager {
             // STRICT OWNER ISOLATION: The bot strictly listens ONLY to the person who linked it!
             // If someone else types .menu, .ping, etc. in a group or DM, NEVER answer them and NEVER react!
             if (!isOwner) {
+              return;
+            }
+
+            // O(1) per-account limiter: 5-command burst, then 4 commands/second.
+            // Commands that fit the bucket are never queued or delayed.
+            if (!this.commandRateLimiter.tryConsume()) {
+              const now = Date.now();
+              if (now - this.lastRateLimitNoticeAt >= 5000) {
+                this.lastRateLimitNoticeAt = now;
+                void sock.sendMessage(remoteJid, {
+                  text: '⌛ Command limit reached. You can run up to 4 commands per second, with a short burst of 5. Please retry shortly.',
+                }, { quoted: msg }).catch(() => {});
+              }
               return;
             }
 
@@ -4657,6 +4781,7 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
                 getTopChatted: (phone: string) => this.getTopChatted(phone),
                 getGroupInviteCode: (gid: string) => this.getGroupInviteCode(gid),
                 setGroupInviteCode: (gid: string, code: string) => this.setGroupInviteCode(gid, code),
+                measureSocketLatency: () => this.measureSocketLatency(),
               });
 
               // If reply is empty (unauthorized, ignored, or internal action), clear reaction and do not send message
@@ -5485,6 +5610,80 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
     } catch {
       return false;
     }
+  }
+
+  public async getGroupContactExport(groupId: string): Promise<{
+    groupName: string;
+    memberCount: number;
+    exportedCount: number;
+    unavailableCount: number;
+    contacts: Array<{ name: string; phone: string }>;
+  }> {
+    const makeError = (status: number, message: string) =>
+      Object.assign(new Error(message), { status });
+
+    if (!groupId || !groupId.endsWith('@g.us')) {
+      throw makeError(400, 'A valid WhatsApp group is required.');
+    }
+    if (!this.sock || !this.currentStatus.isConnected) {
+      throw makeError(409, 'Connect WhatsApp before exporting group contacts.');
+    }
+
+    const metadata = await this.getCachedGroupMetadata(this.sock, groupId, true);
+    if (!metadata || !Array.isArray(metadata.participants)) {
+      throw makeError(404, 'WhatsApp did not return the group participant list.');
+    }
+    if (!(await this.isBotAdminInGroupById(groupId))) {
+      throw makeError(403, 'Only the linked WhatsApp group administrator can export contacts.');
+    }
+
+    const contactsByPhone = new Map<string, { name: string; phone: string }>();
+    const resolvePhone = (value: unknown, source: 'phone' | 'jid' | 'lid'): string | null => {
+      if (typeof value !== 'string' || !value.trim()) return null;
+      const candidate = value.trim();
+
+      if (source === 'lid' || candidate.endsWith('@lid')) {
+        const mapped = this.getLidReverseMapping(candidate);
+        const mappedDigits = mapped?.replace(/\D/g, '') || '';
+        return mappedDigits.length >= 7 && mappedDigits.length <= 15 ? mappedDigits : null;
+      }
+
+      const domain = candidate.includes('@') ? candidate.slice(candidate.lastIndexOf('@') + 1) : '';
+      if (domain && domain !== 's.whatsapp.net') return null;
+      if (candidate.includes('@') && !domain) return null;
+      if (!domain && source !== 'phone') return null;
+
+      const digits = candidate.split('@')[0].split(':')[0].replace(/\D/g, '');
+      return digits.length >= 7 && digits.length <= 15 ? digits : null;
+    };
+
+    for (const participant of metadata.participants) {
+      const phone =
+        resolvePhone(participant.phoneNumber, 'phone') ||
+        resolvePhone(participant.id, 'jid') ||
+        resolvePhone(participant.lid, 'lid');
+      if (!phone) continue;
+
+      const rawName = participant.notify || participant.name || this.contactNames.get(phone) || '';
+      const name = String(rawName).replace(/[\u0000-\u001f\u007f]/g, ' ').trim();
+      const existing = contactsByPhone.get(phone);
+      contactsByPhone.set(phone, {
+        phone,
+        name: name || existing?.name || phone,
+      });
+    }
+
+    const contacts = Array.from(contactsByPhone.values()).sort((a, b) =>
+      a.name.localeCompare(b.name) || a.phone.localeCompare(b.phone)
+    );
+
+    return {
+      groupName: String(metadata.subject || 'WhatsApp Group'),
+      memberCount: metadata.participants.length,
+      exportedCount: contacts.length,
+      unavailableCount: Math.max(0, metadata.participants.length - contacts.length),
+      contacts,
+    };
   }
 
   public async getGroupsWithSettings(adminOnlyFilter = true): Promise<Array<{
