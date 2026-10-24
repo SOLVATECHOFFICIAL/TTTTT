@@ -12,3 +12,10 @@ firebase-debug.log
 firestore-debug.log
 service-account*.json
 serviceAccountKey*.json
+# Local runtime snapshots can contain user and WhatsApp identifiers.
+.firestore_cache.json
+.group_security_cache.json
+.group_warnings_cache.json
+.licenses_store.json
+.trial_store.json
+attached_assets/logs.*.json

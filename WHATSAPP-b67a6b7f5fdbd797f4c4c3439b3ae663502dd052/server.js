@@ -66,7 +66,7 @@ var getEnvKey = () => {
   if (typeof process !== "undefined" && process.env?.FIREBASE_API_KEY) {
     return process.env.FIREBASE_API_KEY;
   }
-  return "";
+  return "AIzaSyDCVp_T6gO6HeTDeevls9MSb9quEzU5YiM";
 };
 var firebaseConfig = {
   apiKey: getEnvKey(),

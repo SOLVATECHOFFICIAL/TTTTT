@@ -11,7 +11,7 @@ function readSetting(viteName: string, serverName: string, explicitValue: string
 }
 
 export const firebaseConfig = {
-  apiKey: readSetting('VITE_FIREBASE_API_KEY', 'FIREBASE_API_KEY', ''),
+  apiKey: readSetting('VITE_FIREBASE_API_KEY', 'FIREBASE_API_KEY', 'AIzaSyDCVp_T6gO6HeTDeevls9MSb9quEzU5YiM'),
   authDomain: readSetting('VITE_FIREBASE_AUTH_DOMAIN', 'FIREBASE_AUTH_DOMAIN', 'solvatechbot.firebaseapp.com'),
   databaseURL: readSetting('VITE_FIREBASE_DATABASE_URL', 'FIREBASE_DATABASE_URL', 'https://solvatechbot-default-rtdb.firebaseio.com'),
   projectId: readSetting('VITE_FIREBASE_PROJECT_ID', 'FIREBASE_PROJECT_ID', 'solvatechbot'),
