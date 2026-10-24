@@ -35,6 +35,12 @@ export const NotificationsPanel: React.FC<NotificationsPanelProps> = ({
     return typeof window !== 'undefined' && 'Notification' in window ? Notification.permission : 'default';
   });
 
+  React.useEffect(() => {
+    if (notifications.length >= 5) {
+      onClear();
+    }
+  }, [notifications.length, onClear]);
+
   if (!isOpen) return null;
 
   const handleRequestPushPermission = async () => {
@@ -130,7 +136,7 @@ export const NotificationsPanel: React.FC<NotificationsPanelProps> = ({
           />
           <div>
             <h3 className="font-bold text-slate-900 dark:text-white text-sm">WhatsApp Notifications</h3>
-            <p className="text-xs text-slate-500">Live Baileys stream ({notifications.length} events)</p>
+            <p className="text-xs text-slate-500">Live Baileys stream ({notifications.length}/5 • auto-cleans)</p>
           </div>
         </div>
         <div className="flex items-center gap-1">

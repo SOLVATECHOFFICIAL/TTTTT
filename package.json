@@ -20,7 +20,7 @@
     "express": "^4.22.3",
     "firebase": "^13.1.0",
     "firebase-admin": "^13.10.0",
-    "link-preview-js": "^3.2.0",
+    "link-preview-js": "^3.0.0",
     "lucide-react": "^0.546.0",
     "motion": "^12.43.0",
     "node-webpmux": "^3.2.1",
@@ -44,9 +44,6 @@
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2",
     "vite-plugin-pwa": "^2.0.0"
-  },
-  "overrides": {
-    "link-preview-js": "^3.0.0"
   },
   "engines": {
     "node": ">=22.0.0"

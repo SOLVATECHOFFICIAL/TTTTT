@@ -308,7 +308,14 @@ export default function App() {
 
       const dataNotifs = await safeParseJson(resNotifs);
       if (dataNotifs && Array.isArray(dataNotifs.notifications)) {
-        setNotifications(dataNotifs.notifications);
+        if (dataNotifs.notifications.length >= 5) {
+          void fetch(`/api/whatsapp/notifications?userId=${encodeURIComponent(currentUser.uid)}`, {
+            method: 'DELETE',
+          }).catch(() => {});
+          setNotifications([]);
+        } else {
+          setNotifications(dataNotifs.notifications);
+        }
       }
 
       setToastNotification({
@@ -687,23 +694,30 @@ export default function App() {
 
         const dataNotifs = await safeParseJson(resNotifs);
         if (dataNotifs && Array.isArray(dataNotifs.notifications)) {
-          setNotifications((prev) => {
-            if (
-              prev.length === dataNotifs.notifications.length &&
-              prev.every((notification, index) => notification.id === dataNotifs.notifications[index]?.id)
-            ) {
-              return prev;
-            }
-            if (prev.length > 0 && dataNotifs.notifications.length > prev.length) {
-              const newest = dataNotifs.notifications[0];
-              if (newest && newest.id !== prev[0]?.id) {
-                setToastNotification(newest);
-                sendDeviceNotification(newest.title, newest.body);
-                setTimeout(() => setToastNotification(null), 5000);
+          if (dataNotifs.notifications.length >= 5) {
+            void fetch(`/api/whatsapp/notifications?userId=${encodeURIComponent(currentUser?.uid || '')}`, {
+              method: 'DELETE',
+            }).catch(() => {});
+            setNotifications([]);
+          } else {
+            setNotifications((prev) => {
+              if (
+                prev.length === dataNotifs.notifications.length &&
+                prev.every((notification, index) => notification.id === dataNotifs.notifications[index]?.id)
+              ) {
+                return prev;
               }
-            }
-            return dataNotifs.notifications;
-          });
+              if (prev.length > 0 && dataNotifs.notifications.length > prev.length) {
+                const newest = dataNotifs.notifications[0];
+                if (newest && newest.id !== prev[0]?.id) {
+                  setToastNotification(newest);
+                  sendDeviceNotification(newest.title, newest.body);
+                  setTimeout(() => setToastNotification(null), 5000);
+                }
+              }
+              return dataNotifs.notifications;
+            });
+          }
         }
       } catch (err) {
         console.debug('Polling WhatsApp note (offline resilient):', err);
