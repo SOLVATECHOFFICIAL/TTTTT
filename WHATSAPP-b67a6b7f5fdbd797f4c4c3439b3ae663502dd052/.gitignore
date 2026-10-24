@@ -1,0 +1,14 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+.baileys_auth/
+.firebase/
+firebase-debug.log
+firestore-debug.log
+service-account*.json
+serviceAccountKey*.json
