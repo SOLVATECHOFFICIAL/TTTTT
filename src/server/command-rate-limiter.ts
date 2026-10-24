@@ -3,12 +3,14 @@
  * A full bucket allows short bursts; steady traffic refills at the configured rate.
  */
 export class TokenBucketRateLimiter {
+  public readonly capacity: number;
+  private readonly refillPerSecond: number;
   private tokens: number;
   private lastRefillAt: number;
 
   constructor(
-    public readonly capacity = 5,
-    private readonly refillPerSecond = 4,
+    capacity = 5,
+    refillPerSecond = 4,
     now = performance.now(),
   ) {
     if (!Number.isFinite(capacity) || capacity <= 0) {
@@ -17,6 +19,8 @@ export class TokenBucketRateLimiter {
     if (!Number.isFinite(refillPerSecond) || refillPerSecond <= 0) {
       throw new RangeError('Token refill rate must be positive.');
     }
+    this.capacity = capacity;
+    this.refillPerSecond = refillPerSecond;
     this.tokens = capacity;
     this.lastRefillAt = now;
   }
