@@ -540,20 +540,7 @@ class CommandHandler {
     accountId?: string
   ): Promise<void> {
     const cleanAccountId = accountId?.trim();
-    if (cleanAccountId && cleanAccountId !== 'default') {
-      await this.loadAccountSecuritySettings(cleanAccountId);
-    }
-    const groupUpdates = { ...updates, updatedAt: new Date().toISOString() };
-    const batch = writeBatch(db);
-    batch.set(doc(db, 'group_security', gid), groupUpdates, { merge: true });
-    if (cleanAccountId && cleanAccountId !== 'default') {
-      batch.set(
-        doc(db, 'group_security', this.getAccountSecurityProfileId(cleanAccountId)),
-        { accountId: cleanAccountId, ...updates, updatedAt: new Date().toISOString() },
-        { merge: true }
-      );
-    }
-    await batch.commit();
+    // 1. Update in-memory and local disk cache immediately (< 1ms) so WhatsApp commands never block on Firestore
     this.securitySettings[gid] = { ...this.getGroupSecuritySettings(gid), ...updates };
     if (cleanAccountId && cleanAccountId !== 'default') {
       this.accountSecuritySettings[cleanAccountId] = {
@@ -562,6 +549,31 @@ class CommandHandler {
       };
     }
     this.saveSettingsToCache();
+
+    // 2. Persist to Firestore asynchronously in background
+    if (!isFirestoreQuotaExhausted()) {
+      void (async () => {
+        try {
+          if (cleanAccountId && cleanAccountId !== 'default') {
+            await this.loadAccountSecuritySettings(cleanAccountId);
+          }
+          const groupUpdates = { ...updates, updatedAt: new Date().toISOString() };
+          const batch = writeBatch(db);
+          batch.set(doc(db, 'group_security', gid), groupUpdates, { merge: true });
+          if (cleanAccountId && cleanAccountId !== 'default') {
+            batch.set(
+              doc(db, 'group_security', this.getAccountSecurityProfileId(cleanAccountId)),
+              { accountId: cleanAccountId, ...updates, updatedAt: new Date().toISOString() },
+              { merge: true }
+            );
+          }
+          await batch.commit();
+        } catch (err: any) {
+          reportFirestoreError(err);
+          console.warn('[commands] Background saveSecuritySettings sync note:', err?.message || err);
+        }
+      })();
+    }
   }
 
   public async setSecuritySetting(
@@ -603,26 +615,16 @@ class CommandHandler {
 
   public async addWarning(gid: string, userJid: string, accountId?: string): Promise<{ count: number; max: number }> {
     const { key, docId, cleanGid, cleanPhone } = this.getNormalizedWarningKey(gid, userJid);
-    const result = await runTransaction(db, async (transaction) => {
-      const warningRef = doc(db, 'group_warnings', docId);
-      const settingsRef = doc(db, 'group_security', gid);
-      const warningSnap = await transaction.get(warningRef);
-      const settingsSnap = await transaction.get(settingsRef);
-      const cleanAccountId = accountId?.trim();
-      const profileSnap = cleanAccountId && cleanAccountId !== 'default'
-        ? await transaction.get(doc(db, 'group_security', this.getAccountSecurityProfileId(cleanAccountId)))
-        : null;
-      const count = (typeof warningSnap.data()?.count === 'number'
-        ? warningSnap.data()!.count
-        : 0) + 1;
-      const configuredLimit = settingsSnap.data()?.warnLimit;
-      const accountLimit = profileSnap?.data()?.warnLimit;
-      const max = typeof accountLimit === 'number'
-        ? Math.min(100, Math.max(1, Math.floor(accountLimit)))
-        : typeof configuredLimit === 'number'
-        ? Math.min(100, Math.max(1, Math.floor(configuredLimit)))
-        : 3;
-      transaction.set(warningRef, {
+    const sec = this.getSecuritySettings(gid, accountId);
+    const max = typeof sec.warnLimit === 'number'
+      ? Math.min(100, Math.max(1, Math.floor(sec.warnLimit)))
+      : 3;
+    const count = (this.warnings[key] || 0) + 1;
+    this.warnings[key] = count;
+    this.saveWarningsToCache();
+
+    if (!isFirestoreQuotaExhausted()) {
+      void setDoc(doc(db, 'group_warnings', docId), {
         count,
         groupId: gid,
         cleanGid,
@@ -630,12 +632,10 @@ class CommandHandler {
         rawKey: key,
         warnLimit: max,
         lastWarnedAt: new Date().toISOString(),
-      }, { merge: true });
-      return { count, max };
-    });
-    this.warnings[key] = result.count;
-    this.saveWarningsToCache();
-    return result;
+      }, { merge: true }).catch((err: any) => reportFirestoreError(err));
+    }
+
+    return { count, max };
   }
 
   public getWarnings(gid: string, userJid: string): number {
@@ -645,46 +645,56 @@ class CommandHandler {
 
   public async clearWarnings(gid: string, userJid: string): Promise<void> {
     const { key, docId, cleanGid, cleanPhone } = this.getNormalizedWarningKey(gid, userJid);
-    await runTransaction(db, async (transaction) => {
-      transaction.set(doc(db, 'group_warnings', docId), {
+    delete this.warnings[key];
+    this.saveWarningsToCache();
+
+    if (!isFirestoreQuotaExhausted()) {
+      void setDoc(doc(db, 'group_warnings', docId), {
         count: 0,
         groupId: gid,
         cleanGid,
         userPhone: cleanPhone,
         rawKey: key,
         clearedAt: new Date().toISOString(),
-      }, { merge: true });
-    });
-    delete this.warnings[key];
-    this.saveWarningsToCache();
+      }, { merge: true }).catch((err: any) => reportFirestoreError(err));
+    }
   }
 
   public async resetAllWarnings(gid: string): Promise<void> {
     const cleanGid = gid.split('@')[0].replace(/\D/g, '') || gid.split('@')[0];
-    const snapshot = await getDocs(collection(db, 'group_warnings'));
-    const groupDocs = snapshot.docs.filter((warningDoc: any) => {
-      const data = warningDoc.data();
-      return data.groupId === gid || data.cleanGid === cleanGid ||
-        warningDoc.id.startsWith(`${cleanGid}__`);
-    });
-    for (let index = 0; index < groupDocs.length; index += 400) {
-      const batch = writeBatch(db);
-      for (const warningDoc of groupDocs.slice(index, index + 400)) {
-        batch.set(warningDoc.ref, {
-          count: 0,
-          groupId: gid,
-          cleanGid,
-          clearedAt: new Date().toISOString(),
-        }, { merge: true });
-      }
-      await batch.commit();
-    }
     for (const key of Object.keys(this.warnings)) {
       if (key.startsWith(`${cleanGid}:`) || key.startsWith(`${gid}:`)) {
         delete this.warnings[key];
       }
     }
     this.saveWarningsToCache();
+
+    if (!isFirestoreQuotaExhausted()) {
+      void (async () => {
+        try {
+          const snapshot = await getDocs(collection(db, 'group_warnings'));
+          const groupDocs = snapshot.docs.filter((warningDoc: any) => {
+            const data = warningDoc.data();
+            return data.groupId === gid || data.cleanGid === cleanGid ||
+              warningDoc.id.startsWith(`${cleanGid}__`);
+          });
+          for (let index = 0; index < groupDocs.length; index += 400) {
+            const batch = writeBatch(db);
+            for (const warningDoc of groupDocs.slice(index, index + 400)) {
+              batch.set(warningDoc.ref, {
+                count: 0,
+                groupId: gid,
+                cleanGid,
+                clearedAt: new Date().toISOString(),
+              }, { merge: true });
+            }
+            await batch.commit();
+          }
+        } catch (err: any) {
+          reportFirestoreError(err);
+        }
+      })();
+    }
   }
 
   public async handle(ctx: CommandContext): Promise<CommandResult> {
@@ -696,18 +706,20 @@ class CommandHandler {
       return { reply: '' };
     }
 
-    // STRICT RULE: Group commands must NEVER answer in 1v1 chat!
+    // If a group-specific command is run in a 1v1 chat, never silently ignore it—provide clear feedback
     if (!ctx.isGroup && GROUP_ONLY_COMMANDS.has(cmd)) {
-      return { reply: '' };
+      return {
+        reply: `ℹ️ *[GROUP COMMAND: .${cmd}]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\nThis command operates on WhatsApp group members or group settings.\n👉 Send *.${cmd}* inside any WhatsApp group where your bot is active!`,
+      };
     }
 
-    // STRICT RULE: Group administration commands (.warn, .kick, .lock, etc.) require BOTH:
-    // 1) The user is a WhatsApp group admin, AND
-    // 2) The user is the owner using their own bot!
+    // Group administration commands require group admin role
     if (ctx.isGroup && ADMIN_ONLY_GROUP_COMMANDS.has(cmd)) {
       const isAuthorized = ctx.isOwner && Boolean(ctx.isGroupAdmin);
       if (!isAuthorized) {
-        return { reply: '' };
+        return {
+          reply: `⚠️ *[ADMIN PRIVILEGE REQUIRED]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\nThe command *.${cmd}* requires your linked WhatsApp account to be a *Group Administrator* in this group.`,
+        };
       }
     }
 
@@ -1540,23 +1552,24 @@ Message successfully pinned for 7 days by Group Admin!
       };
     }
 
-    if (cmd === 'antilink' || cmd === 'anti') {
+    if (cmd === 'antilink' || (cmd === 'anti' && ctx.args.length > 0)) {
       if (!ctx.isGroup) {
-        return { reply: `⚠️ *[GROUP ONLY]*\nThe *.anti* command can only be used inside a WhatsApp group.` };
+        return { reply: `⚠️ *[GROUP ONLY]*\nThe *.${cmd}* command can only be used inside a WhatsApp group.` };
       }
       if (!ctx.isOwner && !ctx.isGroupAdmin) {
         return { reply: `⛔ *[ACCESS DENIED]*\nOnly Group Administrators connected to the bot can configure group protection.` };
       }
       const gid = ctx.groupJid || 'default';
       const requestedState = ctx.args[0]?.toLowerCase();
-      if (cmd === 'anti' && !requestedState) {
-        const enabled = this.getSecuritySettings(gid, ctx.securityScope).antilink;
+      if (requestedState === 'all') {
+        const subState = ctx.args[1]?.toLowerCase() === 'off' ? false : true;
+        await this.toggleAllForGroup(gid, subState, ctx.securityScope);
         return {
-          reply: `🛡️ *[ANTI-LINK STATUS]*\nAnti-Link is currently *${enabled ? 'ON' : 'OFF'}*.\nUse *.anti on* or *.anti off* to change it.`,
+          reply: `🛡️ *[ALL GROUP DEFENSES ${subState ? 'ENABLED' : 'DISABLED'}]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n• Anti-Link: *${subState ? '✅ ON' : '❌ OFF'}*\n• Anti-Bot: *${subState ? '✅ ON' : '❌ OFF'}*\n• Anti-Status: *${subState ? '✅ ON' : '❌ OFF'}*\n• Anti-Spam: *${subState ? '✅ ON' : '❌ OFF'}*\n• Auto-Welcome: *${subState ? '✅ ON' : '❌ OFF'}*\n• Auto-Goodbye: *${subState ? '✅ ON' : '❌ OFF'}*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚡ _SOLVATECH Group Defense_`,
         };
       }
       if (requestedState && requestedState !== 'on' && requestedState !== 'off') {
-        return { reply: `Usage: *.anti on* or *.anti off* (alias for *.antilink*).` };
+        return { reply: `Usage: *.anti* (view defense matrix), *.anti on* / *.anti off* (toggle Anti-Link), or *.anti all on* / *.anti all off*.` };
       }
       const val = requestedState === 'off' ? false : true;
       await this.setSecuritySetting(gid, 'antilink', val, ctx.securityScope);

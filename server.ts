@@ -1060,6 +1060,52 @@ async function startServer() {
     res.json({ success: true, message: 'Notifications cleared' });
   });
 
+  app.get('/api/whatsapp/command-logs', (req, res) => {
+    const session = getSessionForReq(req);
+    res.json({
+      success: true,
+      logs: session.getCommandLogs(200),
+      stats: session.getCommandStats(),
+    });
+  });
+
+  app.delete('/api/whatsapp/command-logs', (req, res) => {
+    const session = getSessionForReq(req);
+    session.clearCommandLogs();
+    res.json({
+      success: true,
+      logs: [],
+      stats: session.getCommandStats(),
+      message: 'Command execution logs cleared',
+    });
+  });
+
+  app.get('/api/whatsapp/command-logs/stream', (req, res) => {
+    const session = getSessionForReq(req);
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    const unsubscribe = session.subscribeCommandLogs((event) => {
+      try {
+        res.write(`data: ${JSON.stringify(event)}\n\n`);
+      } catch {}
+    });
+
+    const heartbeat = setInterval(() => {
+      try {
+        res.write(`: heartbeat ${Date.now()}\n\n`);
+      } catch {}
+    }, 15000);
+
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+    });
+  });
+
   app.post('/api/whatsapp/pair-code', async (req, res) => {
     try {
       const { phoneNumber, force = false } = req.body;
@@ -1746,17 +1792,29 @@ async function startServer() {
         (req.body.groupJid ||
           ['link', 'groupinfo', 'anti', 'autowelcome', 'autogoodbye', 'antilink', 'antibot', 'antistatus', 'antispam', 'warn', 'warnlimit', 'warns'].includes(command));
       const groupJid = req.body.groupJid || req.body.groupId || (isSimulatedGroup ? '1203630248491823@g.us' : undefined);
+      const execStart = performance.now();
+      const senderPhone = status.user?.phone?.replace(/\D/g, '') || '2349049979183';
+      const cmdLog = session.startCommandLog({
+        command,
+        fullText: cleanText.startsWith('.') ? cleanText : `.${cleanText}`,
+        args,
+        sender: `+${senderPhone}`,
+        chatType: 'console',
+        chatName: 'Web Command Console',
+        remoteJid: groupJid || `${senderPhone}@s.whatsapp.net`,
+      });
       await commandHandler.loadAccountSecuritySettings(session.userId);
       const result = await commandHandler.handle({
         command,
         args,
         fullText: cleanText,
         senderJid: status.user?.phone ? `${status.user.phone.replace(/\D/g, '')}@s.whatsapp.net` : '2349049979183@s.whatsapp.net',
-        senderNumber: status.user?.phone?.replace(/\D/g, '') || '2349049979183',
+        senderNumber: senderPhone,
         isGroup: Boolean(isSimulatedGroup),
         groupJid,
         pushName: status.user?.name || 'Solvatech User',
         isOwner: isOwner ?? true,
+        isGroupAdmin: true,
         securityScope: session.userId,
         linkedSince: session.getConnectedAt(),
         linkedPhone: status.user?.phone || null,
@@ -1768,8 +1826,19 @@ async function startServer() {
         isGroupParticipantAdmin: (gid: string, participantJid: string) =>
           session.isGroupParticipantAdmin(gid, participantJid),
       });
+      const elapsedMs = Math.max(1, Math.round((performance.now() - execStart) * 10) / 10);
+      session.finishCommandLog(cmdLog.id, {
+        status: 'completed',
+        responseTimeMs: elapsedMs,
+        replyPreview: result?.reply || 'Executed from Web Console',
+      });
 
-      res.json({ success: true, result });
+      res.json({
+        success: true,
+        result,
+        logs: session.getCommandLogs(200),
+        stats: session.getCommandStats(),
+      });
     } catch (err: any) {
       res.status(500).json({ success: false, error: err.message });
     }

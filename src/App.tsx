@@ -61,6 +61,11 @@ import {
   WhatsAppNotification,
 } from './components/NotificationsPanel';
 import {
+  RealTimeCommandLogs,
+  CommandExecutionLogItem,
+  CommandExecutionStatsData,
+} from './components/RealTimeCommandLogs';
+import {
   OWNER_EMAIL,
   isOwnerEmail,
   calculateRemainingTime,
@@ -146,6 +151,20 @@ export default function App() {
   const [isNotificationsOpen, setIsNotificationsOpen] = useState(false);
   const [notifications, setNotifications] = useState<WhatsAppNotification[]>([]);
   const [toastNotification, setToastNotification] = useState<WhatsAppNotification | null>(null);
+  const [commandLogs, setCommandLogs] = useState<CommandExecutionLogItem[]>([]);
+  const [commandStats, setCommandStats] = useState<CommandExecutionStatsData>({
+    totalExecuted: 0,
+    completedCount: 0,
+    errorCount: 0,
+    avgResponseTimeMs: 0,
+    minResponseTimeMs: 0,
+    maxResponseTimeMs: 0,
+    lastResponseTimeMs: 0,
+    commandsPerMinute: 0,
+    peakCommandsPerMinute: 0,
+    lastExecutedAt: null,
+  });
+  const [isCommandStreamLive, setIsCommandStreamLive] = useState(false);
 
   // Sign-in gateway mode for unauthenticated users
   const [authMode, setAuthMode] = useState<'google' | 'signup' | 'login'>('google');
@@ -735,6 +754,134 @@ export default function App() {
       if (timer) clearTimeout(timer);
     };
   }, [currentUser?.uid, isPairingActive]);
+
+  const fetchCommandLogs = async () => {
+    if (!currentUser?.uid) return;
+    try {
+      const curEmail = currentUser?.email || '';
+      const emailParam = curEmail ? `&userEmail=${encodeURIComponent(curEmail)}` : '';
+      const res = await fetch(
+        `/api/whatsapp/command-logs?userId=${encodeURIComponent(currentUser.uid)}${emailParam}`,
+        { headers: { 'x-user-email': curEmail } }
+      );
+      const data = await safeParseJson(res);
+      if (data?.success) {
+        if (Array.isArray(data.logs)) setCommandLogs(data.logs);
+        if (data.stats) setCommandStats(data.stats);
+      }
+    } catch {}
+  };
+
+  const handleClearCommandLogs = async () => {
+    if (!currentUser?.uid) return;
+    try {
+      const curEmail = currentUser?.email || '';
+      await fetch(`/api/whatsapp/command-logs?userId=${encodeURIComponent(currentUser.uid)}`, {
+        method: 'DELETE',
+        headers: { 'x-user-email': curEmail },
+      });
+      setCommandLogs([]);
+      void fetchCommandLogs();
+    } catch {}
+  };
+
+  const handleQuickTestCommand = async (cmdText: string) => {
+    if (!currentUser?.uid) return;
+    try {
+      const curEmail = currentUser?.email || '';
+      const res = await fetch('/api/commands/execute', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-id': currentUser.uid,
+          'x-user-email': curEmail,
+        },
+        body: JSON.stringify({
+          userId: currentUser.uid,
+          userEmail: curEmail,
+          text: cmdText,
+          isOwner: true,
+          licenseExpiresAt: userLicenseData.expiresAt,
+          licensePlan: userLicenseData.isUnlimited ? 'UNLIMITED' : 'ACTIVE',
+        }),
+      });
+      const data = await safeParseJson(res);
+      if (data?.logs) setCommandLogs(data.logs);
+      if (data?.stats) setCommandStats(data.stats);
+    } catch {}
+  };
+
+  // Real-time Server-Sent Events (SSE) subscription for WhatsApp command executions
+  useEffect(() => {
+    if (!currentUser?.uid) return;
+    const userId = currentUser.uid;
+    const curEmail = currentUser.email || '';
+    const emailParam = curEmail ? `&userEmail=${encodeURIComponent(curEmail)}` : '';
+
+    void fetchCommandLogs();
+
+    let es: EventSource | null = null;
+    let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+    let isUnmounted = false;
+
+    const connectStream = () => {
+      if (isUnmounted) return;
+      try {
+        es = new EventSource(
+          `/api/whatsapp/command-logs/stream?userId=${encodeURIComponent(userId)}${emailParam}`
+        );
+        es.onopen = () => {
+          if (!isUnmounted) setIsCommandStreamLive(true);
+        };
+        es.onmessage = (evt) => {
+          if (isUnmounted || !evt.data) return;
+          try {
+            const payload = JSON.parse(evt.data);
+            if (payload.stats) {
+              setCommandStats(payload.stats);
+            }
+            if (payload.type === 'init' && Array.isArray(payload.logs)) {
+              setCommandLogs(payload.logs);
+            } else if (payload.type === 'clear') {
+              setCommandLogs([]);
+            } else if (payload.type === 'upsert' && payload.log) {
+              setCommandLogs((prev) => {
+                const idx = prev.findIndex((item) => item.id === payload.log.id);
+                if (idx >= 0) {
+                  const copy = [...prev];
+                  copy[idx] = payload.log;
+                  return copy;
+                }
+                return [payload.log, ...prev].slice(0, 200);
+              });
+            }
+          } catch {}
+        };
+        es.onerror = () => {
+          setIsCommandStreamLive(false);
+          try {
+            es?.close();
+          } catch {}
+          if (!isUnmounted) {
+            reconnectTimeout = setTimeout(connectStream, 4000);
+          }
+        };
+      } catch {
+        setIsCommandStreamLive(false);
+      }
+    };
+
+    connectStream();
+
+    return () => {
+      isUnmounted = true;
+      setIsCommandStreamLive(false);
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      try {
+        es?.close();
+      } catch {}
+    };
+  }, [currentUser?.uid, currentUser?.email]);
 
   // Tab visibility change: auto-refresh status when user switches back from WhatsApp
   useEffect(() => {
@@ -1839,6 +1986,20 @@ export default function App() {
                 </div>
               )}
 
+              {/* Always-Visible Real-Time Command Execution Logs when Connected or when commands have been run */}
+              {(status.isConnected || commandLogs.length > 0) && (
+                <RealTimeCommandLogs
+                  logs={commandLogs}
+                  stats={commandStats}
+                  isConnected={status.isConnected}
+                  isStreamLive={isCommandStreamLive}
+                  onClearLogs={handleClearCommandLogs}
+                  onRefreshLogs={fetchCommandLogs}
+                  onQuickTestCommand={handleQuickTestCommand}
+                  compact
+                />
+              )}
+
               {/* WhatsApp Reconnecting Card (e.g. after Railway restart) */}
               {!status.isConnected && status.isPaired && !status.pairingCode && status.pairingStage !== 'code_generated' && status.state === 'connecting' && (
                 <div className="p-4 rounded-2xl bg-gradient-to-r from-emerald-950/40 via-slate-900 to-teal-950/30 border border-emerald-500/50 space-y-3 shadow-xl">
@@ -2899,6 +3060,17 @@ export default function App() {
           {/* TAB 3: COMMANDS (TAP ANY COMMAND TO COPY) */}
           {activeTab === 'commands' && (
             <div className="space-y-3">
+              {/* Real-Time Command Execution Console & Telemetry */}
+              <RealTimeCommandLogs
+                logs={commandLogs}
+                stats={commandStats}
+                isConnected={status.isConnected}
+                isStreamLive={isCommandStreamLive}
+                onClearLogs={handleClearCommandLogs}
+                onRefreshLogs={fetchCommandLogs}
+                onQuickTestCommand={handleQuickTestCommand}
+              />
+
               <div className="p-3 rounded-2xl bg-slate-950 border border-slate-800 space-y-2">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
@@ -3002,13 +3174,20 @@ export default function App() {
             <button
               type="button"
               onClick={() => setActiveTab('commands')}
-              className={`flex flex-col items-center justify-center gap-1 py-1.5 px-1 rounded-xl transition-all cursor-pointer ${
+              className={`flex flex-col items-center justify-center gap-1 py-1.5 px-1 rounded-xl transition-all relative cursor-pointer ${
                 activeTab === 'commands'
                   ? 'bg-emerald-500/15 text-emerald-400 font-bold border border-emerald-500/30 shadow-xs'
                   : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/50'
               }`}
             >
-              <Terminal className="w-4 h-4 shrink-0" />
+              <div className="relative">
+                <Terminal className="w-4 h-4 shrink-0" />
+                {commandStats.totalExecuted > 0 && (
+                  <span className="px-1 min-w-[14px] h-3.5 rounded-full bg-emerald-500 text-slate-950 font-mono font-black text-[8px] flex items-center justify-center absolute -top-1.5 -right-2.5 shadow-xs">
+                    {commandStats.totalExecuted > 99 ? '99+' : commandStats.totalExecuted}
+                  </span>
+                )}
+              </div>
               <span className="truncate">Commands</span>
             </button>
 

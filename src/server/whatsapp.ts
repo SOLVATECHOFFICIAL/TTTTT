@@ -465,6 +465,39 @@ export interface WhatsAppNotification {
   data?: any;
 }
 
+export interface CommandExecutionLog {
+  id: string;
+  command: string;
+  fullText: string;
+  args: string[];
+  sender: string;
+  chatType: 'group' | 'direct' | 'console';
+  chatName: string;
+  remoteJid: string;
+  timestamp: string;
+  startedAtMs: number;
+  completedAtMs?: number;
+  responseTimeMs: number;
+  status: 'executing' | 'completed' | 'error';
+  ratePerMinute: number;
+  speedRating: 'ULTRA-FAST' | 'FAST' | 'NORMAL' | 'HEAVY';
+  replyPreview?: string;
+  errorMessage?: string;
+}
+
+export interface CommandExecutionStats {
+  totalExecuted: number;
+  completedCount: number;
+  errorCount: number;
+  avgResponseTimeMs: number;
+  minResponseTimeMs: number;
+  maxResponseTimeMs: number;
+  lastResponseTimeMs: number;
+  commandsPerMinute: number;
+  peakCommandsPerMinute: number;
+  lastExecutedAt: string | null;
+}
+
 export type PairingStage = 'idle' | 'code_generated' | 'pairing_handshake' | 'connected' | 'expired';
 
 export interface WhatsAppStatus {
@@ -560,6 +593,14 @@ export class WhatsAppManager {
   private authDir: string;
   private antiDeleteEnabled = true;
   private notifications: WhatsAppNotification[] = [];
+  private commandLogs: CommandExecutionLog[] = [];
+  private peakCommandsPerMinute = 0;
+  private commandLogListeners = new Set<(event: {
+    type: 'init' | 'upsert' | 'clear';
+    log?: CommandExecutionLog;
+    logs?: CommandExecutionLog[];
+    stats: CommandExecutionStats;
+  }) => void>();
   private mediaCacheDir: string;
   private reconnectingStartedAt: number | null = null;
   public reconnectTimedOut = false;
@@ -753,6 +794,7 @@ export class WhatsAppManager {
     this.loadSessionLicense();
     this.loadAntiDeleteSetting();
     this.loadCachedGroups();
+    this.loadCommandLogs();
 
     this.addNotification({
       type: 'system',
@@ -760,6 +802,202 @@ export class WhatsAppManager {
       body: `Baileys WhatsApp service initialized for user account ${this.userEmail || this.userId}.`,
     });
 
+  }
+
+  private loadCommandLogs() {
+    try {
+      const logFile = path.join(this.authDir, 'command_logs.json');
+      if (fs.existsSync(logFile)) {
+        const parsed = JSON.parse(fs.readFileSync(logFile, 'utf-8'));
+        if (Array.isArray(parsed?.logs)) {
+          this.commandLogs = parsed.logs.slice(0, 300);
+        }
+        if (typeof parsed?.peakCommandsPerMinute === 'number') {
+          this.peakCommandsPerMinute = parsed.peakCommandsPerMinute;
+        }
+      }
+    } catch {}
+  }
+
+  private saveCommandLogs() {
+    try {
+      if (!fs.existsSync(this.authDir)) {
+        fs.mkdirSync(this.authDir, { recursive: true });
+      }
+      const logFile = path.join(this.authDir, 'command_logs.json');
+      fs.writeFileSync(
+        logFile,
+        JSON.stringify({
+          updatedAt: new Date().toISOString(),
+          peakCommandsPerMinute: this.peakCommandsPerMinute,
+          logs: this.commandLogs.slice(0, 300),
+        }),
+        'utf-8'
+      );
+    } catch {}
+  }
+
+  private computeSpeedRating(ms: number): 'ULTRA-FAST' | 'FAST' | 'NORMAL' | 'HEAVY' {
+    if (ms <= 150) return 'ULTRA-FAST';
+    if (ms <= 500) return 'FAST';
+    if (ms <= 1500) return 'NORMAL';
+    return 'HEAVY';
+  }
+
+  public getCommandStats(): CommandExecutionStats {
+    const now = Date.now();
+    const totalExecuted = this.commandLogs.length;
+    const completedLogs = this.commandLogs.filter((l) => l.status === 'completed' && l.responseTimeMs > 0);
+    const errorCount = this.commandLogs.filter((l) => l.status === 'error').length;
+    const oneMinAgo = now - 60000;
+    const commandsPerMinute = this.commandLogs.filter((l) => l.startedAtMs >= oneMinAgo).length;
+    if (commandsPerMinute > this.peakCommandsPerMinute) {
+      this.peakCommandsPerMinute = commandsPerMinute;
+    }
+
+    const times = completedLogs.map((l) => l.responseTimeMs);
+    const avgResponseTimeMs =
+      times.length > 0 ? Math.round((times.reduce((a, b) => a + b, 0) / times.length) * 10) / 10 : 0;
+    const minResponseTimeMs = times.length > 0 ? Math.round(Math.min(...times) * 10) / 10 : 0;
+    const maxResponseTimeMs = times.length > 0 ? Math.round(Math.max(...times) * 10) / 10 : 0;
+    const lastResponseTimeMs = completedLogs[0]?.responseTimeMs || this.commandLogs[0]?.responseTimeMs || 0;
+
+    return {
+      totalExecuted,
+      completedCount: completedLogs.length,
+      errorCount,
+      avgResponseTimeMs,
+      minResponseTimeMs,
+      maxResponseTimeMs,
+      lastResponseTimeMs,
+      commandsPerMinute,
+      peakCommandsPerMinute: Math.max(this.peakCommandsPerMinute, commandsPerMinute),
+      lastExecutedAt: this.commandLogs[0]?.timestamp || null,
+    };
+  }
+
+  public getCommandLogs(limit = 200): CommandExecutionLog[] {
+    return this.commandLogs.slice(0, limit);
+  }
+
+  public clearCommandLogs() {
+    this.commandLogs = [];
+    this.saveCommandLogs();
+    const stats = this.getCommandStats();
+    for (const listener of this.commandLogListeners) {
+      try {
+        listener({ type: 'clear', logs: [], stats });
+      } catch {}
+    }
+  }
+
+  public subscribeCommandLogs(
+    listener: (event: {
+      type: 'init' | 'upsert' | 'clear';
+      log?: CommandExecutionLog;
+      logs?: CommandExecutionLog[];
+      stats: CommandExecutionStats;
+    }) => void
+  ): () => void {
+    this.commandLogListeners.add(listener);
+    try {
+      listener({
+        type: 'init',
+        logs: this.getCommandLogs(150),
+        stats: this.getCommandStats(),
+      });
+    } catch {}
+    return () => {
+      this.commandLogListeners.delete(listener);
+    };
+  }
+
+  public startCommandLog(params: {
+    command: string;
+    fullText: string;
+    args: string[];
+    sender: string;
+    chatType: 'group' | 'direct' | 'console';
+    chatName: string;
+    remoteJid: string;
+  }): CommandExecutionLog {
+    const now = Date.now();
+    const oneMinAgo = now - 60000;
+    const currentRate = this.commandLogs.filter((l) => l.startedAtMs >= oneMinAgo).length + 1;
+    if (currentRate > this.peakCommandsPerMinute) {
+      this.peakCommandsPerMinute = currentRate;
+    }
+
+    const entry: CommandExecutionLog = {
+      id: `cmd_${now}_${Math.random().toString(36).substring(2, 8)}`,
+      command: params.command.startsWith('.') ? params.command.slice(1).toLowerCase() : params.command.toLowerCase(),
+      fullText: params.fullText,
+      args: params.args,
+      sender: params.sender,
+      chatType: params.chatType,
+      chatName: params.chatName,
+      remoteJid: params.remoteJid,
+      timestamp: new Date(now).toISOString(),
+      startedAtMs: now,
+      responseTimeMs: 0,
+      status: 'executing',
+      ratePerMinute: currentRate,
+      speedRating: 'ULTRA-FAST',
+    };
+
+    this.commandLogs.unshift(entry);
+    if (this.commandLogs.length > 300) {
+      this.commandLogs = this.commandLogs.slice(0, 300);
+    }
+
+    const stats = this.getCommandStats();
+    for (const listener of this.commandLogListeners) {
+      try {
+        listener({ type: 'upsert', log: entry, stats });
+      } catch {}
+    }
+
+    return entry;
+  }
+
+  public finishCommandLog(
+    id: string,
+    result: {
+      status: 'completed' | 'error';
+      responseTimeMs: number;
+      replyPreview?: string;
+      errorMessage?: string;
+    }
+  ): CommandExecutionLog | null {
+    const idx = this.commandLogs.findIndex((l) => l.id === id);
+    if (idx === -1) return null;
+
+    const cleanPreview = (result.replyPreview || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 220);
+
+    const updated: CommandExecutionLog = {
+      ...this.commandLogs[idx],
+      status: result.status,
+      completedAtMs: Date.now(),
+      responseTimeMs: Math.max(1, Math.round(result.responseTimeMs * 10) / 10),
+      speedRating: this.computeSpeedRating(result.responseTimeMs),
+      replyPreview: cleanPreview || (result.status === 'completed' ? 'Command executed on WhatsApp' : undefined),
+      errorMessage: result.errorMessage,
+    };
+
+    this.commandLogs[idx] = updated;
+    this.saveCommandLogs();
+
+    const stats = this.getCommandStats();
+    for (const listener of this.commandLogListeners) {
+      try {
+        listener({ type: 'upsert', log: updated, stats });
+      } catch {}
+    }
+
+    return updated;
   }
 
   private loadCachedGroups() {
@@ -874,6 +1112,39 @@ export class WhatsAppManager {
     } catch (err: any) {
       console.warn(`[Signal Crypto Repair (${this.userId})] Error during auto-recovery:`, err?.message || err);
     }
+  }
+
+  private async clearGroupSenderKey(groupJid: string) {
+    if (!groupJid || !groupJid.endsWith('@g.us')) return;
+    const cleanGroup = groupJid.split('@')[0];
+    try {
+      if (fs.existsSync(this.authDir)) {
+        for (const file of fs.readdirSync(this.authDir)) {
+          if (file.startsWith('sender-key-') && file.includes(cleanGroup)) {
+            try {
+              fs.unlinkSync(path.join(this.authDir, file));
+            } catch {}
+          }
+        }
+      }
+      if (this.sock?.authState?.keys) {
+        const keysStore = this.sock.authState.keys as any;
+        const meId = this.sock.user?.id || (this.sock.authState.creds?.me as any)?.id || '';
+        const meLid = (this.sock.user as any)?.lid || (this.sock.authState.creds?.me as any)?.lid || '';
+        const senderKeyClear: Record<string, null> = {};
+        for (const raw of [meId, meLid].filter(Boolean)) {
+          const userPart = String(raw).split('@')[0].split(':')[0];
+          if (userPart) {
+            senderKeyClear[`${groupJid}::${userPart}::0`] = null;
+            senderKeyClear[`${groupJid}::${userPart}:0`] = null;
+            senderKeyClear[`${groupJid}::${raw}`] = null;
+          }
+        }
+        if (Object.keys(senderKeyClear).length > 0) {
+          await keysStore.set({ 'sender-key': senderKeyClear });
+        }
+      }
+    } catch {}
   }
 
   public repairCorruptedSessions(): number {
@@ -1975,34 +2246,97 @@ export class WhatsAppManager {
 
   // High-Speed In-Memory Group Metadata Cache (eliminates repeated slow network roundtrips)
   private groupMetaCache = new Map<string, { meta: any; timestamp: number }>();
+  private groupMetaInFlight = new Map<string, Promise<any>>();
 
-  public async getCachedGroupMetadata(sock: any, gid: string, force = false): Promise<any> {
-    const now = Date.now();
-    const cached = this.groupMetaCache.get(gid);
-    if (!force && cached && now - cached.timestamp < 60000) {
-      return cached.meta;
+  private cacheGroupMetaInstance(gid: string, meta: any) {
+    if (!gid || !meta) return;
+    setBoundedCache(this.groupMetaCache, gid, { meta, timestamp: Date.now() }, 300);
+    if (meta.subject) {
+      setBoundedCache(this.groupSubjectCache, gid, meta.subject, 1000);
     }
-    try {
-      const meta = await sock.groupMetadata(gid);
-      if (meta) {
-        setBoundedCache(this.groupMetaCache, gid, { meta, timestamp: now }, 250);
-        if (Array.isArray(meta.participants)) {
-          for (const p of meta.participants) {
-            if (p.id && p.lid) {
-              const cleanP = p.id.split('@')[0].split(':')[0].replace(/\D/g, '');
-              const cleanL = p.lid.split('@')[0].split(':')[0].replace(/\D/g, '');
-              if (cleanP && cleanL) {
-                setBoundedCache(this.reverseLidMap, cleanL, cleanP, 2000);
-              }
-            }
+    if (Array.isArray(meta.participants)) {
+      for (const p of meta.participants) {
+        const rawPhone = p.phoneNumber || (p.id && !String(p.id).endsWith('@lid') ? p.id : '');
+        const rawLid = p.lid || (p.id && String(p.id).endsWith('@lid') ? p.id : '');
+        if (rawPhone && rawLid) {
+          const cleanP = String(rawPhone).split('@')[0].split(':')[0].replace(/\D/g, '');
+          const cleanL = String(rawLid).split('@')[0].split(':')[0].replace(/\D/g, '');
+          if (cleanP && cleanL) {
+            setBoundedCache(this.reverseLidMap, cleanL, cleanP, 2000);
           }
         }
       }
-      return meta;
-    } catch (err) {
-      if (cached && !force) return cached.meta;
-      throw err;
     }
+  }
+
+  public async getCachedGroupMetadata(sock: any, gid: string, force = false): Promise<any> {
+    if (!gid || !gid.endsWith('@g.us')) return null;
+    const now = Date.now();
+    const cached = this.groupMetaCache.get(gid);
+    const hasParticipants = Array.isArray(cached?.meta?.participants) && cached.meta.participants.length > 0;
+
+    // Serve warm cache immediately (0ms) for up to 15 minutes; trigger background refresh if older than 2 minutes
+    if (!force && cached && hasParticipants && now - cached.timestamp < 15 * 60 * 1000) {
+      if (now - cached.timestamp > 2 * 60 * 1000 && !this.groupMetaInFlight.has(gid) && sock?.groupMetadata) {
+        const bgFetch = Promise.race([
+          sock.groupMetadata(gid),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 3500)),
+        ])
+          .then((fresh) => {
+            if (fresh && Array.isArray(fresh.participants) && fresh.participants.length > 0) {
+              this.cacheGroupMetaInstance(gid, fresh);
+            }
+          })
+          .catch(() => {})
+          .finally(() => {
+            this.groupMetaInFlight.delete(gid);
+          });
+        this.groupMetaInFlight.set(gid, bgFetch);
+      }
+      return cached.meta;
+    }
+
+    if (!force && this.groupMetaInFlight.has(gid)) {
+      const inflight = await this.groupMetaInFlight.get(gid);
+      if (inflight) return inflight;
+    }
+
+    const fetchPromise = (async () => {
+      try {
+        const meta = await Promise.race([
+          sock.groupMetadata(gid),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('groupMetadata timeout')), 2500)
+          ),
+        ]);
+        if (meta) {
+          this.cacheGroupMetaCacheWithDisk(gid, meta);
+        }
+        return meta;
+      } catch {
+        if (cached?.meta) return cached.meta;
+        const diskCached = this.cachedGroups.find((g) => g.id === gid);
+        if (diskCached) {
+          return {
+            id: gid,
+            subject: diskCached.subject || 'WhatsApp Group',
+            desc: diskCached.desc || '',
+            size: diskCached.memberCount || diskCached.size || 0,
+            participants: Array.isArray(diskCached.participants) ? diskCached.participants : [],
+          };
+        }
+        return null;
+      } finally {
+        this.groupMetaInFlight.delete(gid);
+      }
+    })();
+
+    this.groupMetaInFlight.set(gid, fetchPromise);
+    return fetchPromise;
+  }
+
+  private cacheGroupMetaCacheWithDisk(gid: string, meta: any) {
+    this.cacheGroupMetaInstance(gid, meta);
   }
 
   public invalidateGroupMetaCache(gid: string) {
@@ -2500,7 +2834,7 @@ export class WhatsAppManager {
 
     this.initPromise = (async () => {
       try {
-        await commandHandler.loadAccountSecuritySettings(this.userId);
+        void commandHandler.loadAccountSecuritySettings(this.userId);
         if (this.sock) {
           const wsObj = (this.sock as any)?.ws?.socket || (this.sock as any)?.ws?._ws || (this.sock as any)?.ws;
           const wsState = wsObj?.readyState;
@@ -2558,13 +2892,20 @@ export class WhatsAppManager {
           printQRInTerminal: false,
           browser: Browsers.ubuntu('Chrome'),
           connectTimeoutMs: 60000,
-          defaultQueryTimeoutMs: 60000,
+          defaultQueryTimeoutMs: 12000,
           keepAliveIntervalMs: 25000,
-          retryRequestDelayMs: 500,
+          retryRequestDelayMs: 350,
           maxMsgRetryCount: 5,
           generateHighQualityLinkPreview: false,
           syncFullHistory: false,
           markOnlineOnConnect: true,
+          cachedGroupMetadata: async (jid: string) => {
+            const cached = this.groupMetaCache.get(jid);
+            if (cached?.meta && Array.isArray(cached.meta.participants) && cached.meta.participants.length > 0) {
+              return cached.meta;
+            }
+            return undefined;
+          },
           getMessage: async (key: any) => {
             if (key.id && this.messageCache.has(key.id)) {
               const cached = this.messageCache.get(key.id);
@@ -3046,6 +3387,10 @@ export class WhatsAppManager {
             unwrappedMsg?.imageMessage?.caption ||
             unwrappedMsg?.videoMessage?.caption ||
             unwrappedMsg?.documentMessage?.caption ||
+            unwrappedMsg?.buttonsResponseMessage?.selectedButtonId ||
+            unwrappedMsg?.buttonsResponseMessage?.selectedDisplayText ||
+            unwrappedMsg?.listResponseMessage?.title ||
+            unwrappedMsg?.templateButtonReplyMessage?.selectedDisplayText ||
             '';
 
           // Cache message for Anti-Delete recovery and .del commands
@@ -3275,13 +3620,54 @@ export class WhatsAppManager {
             }
           }
 
-          const botUserJid = sock.user?.id || (sock as any).authState?.creds?.me?.id || '';
-          const botUserLid = (sock as any).user?.lid || (sock as any).authState?.creds?.me?.lid || '';
+          const credsMe = (sock as any).authState?.creds?.me || sock.user || {};
+          let diskMeId = '';
+          let diskMeLid = '';
+          try {
+            const credsPath = path.join(this.authDir, 'creds.json');
+            if (fs.existsSync(credsPath)) {
+              const c = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
+              diskMeId = c?.me?.id || '';
+              diskMeLid = c?.me?.lid || '';
+            }
+          } catch {}
+
+          const botUserJid = sock.user?.id || credsMe.id || diskMeId || '';
+          const botUserLid = (sock as any).user?.lid || credsMe.lid || diskMeLid || '';
           const botPhone = (botUserJid.split(':')[0] || botUserJid.split('@')[0]).replace(/\D/g, '');
           const botLidNum = (botUserLid.split(':')[0] || botUserLid.split('@')[0]).replace(/\D/g, '');
           const linkedPhoneClean = (this.currentStatus.user?.phone || this.currentStatus.targetPhone || '').replace(/\D/g, '');
           const participantRaw = msg.key.participant || senderJid || '';
           const participantNum = participantRaw.split('@')[0].split(':')[0].replace(/\D/g, '');
+          const remoteDigits = remoteJid.split('@')[0].split(':')[0].replace(/\D/g, '');
+
+          const ownerKnownIds = new Set<string>();
+          if (botPhone) ownerKnownIds.add(botPhone);
+          if (linkedPhoneClean) ownerKnownIds.add(linkedPhoneClean);
+          if (botLidNum) ownerKnownIds.add(botLidNum);
+
+          // If this message is from the linked phone itself (fromMe) and has a participant LID, register that LID as the bot owner's LID
+          if (isFromMe && participantNum) {
+            ownerKnownIds.add(participantNum);
+            const ownerPhoneForLid = botPhone || linkedPhoneClean;
+            if (ownerPhoneForLid && participantNum !== ownerPhoneForLid) {
+              setBoundedCache(this.reverseLidMap, participantNum, ownerPhoneForLid, 2000);
+            }
+          }
+
+          for (const phone of [botPhone, linkedPhoneClean].filter(Boolean)) {
+            try {
+              const directFile = path.join(this.authDir, `lid-mapping-${phone}.json`);
+              if (fs.existsSync(directFile)) {
+                const mappedLid = String(JSON.parse(fs.readFileSync(directFile, 'utf8'))).replace(/\D/g, '');
+                if (mappedLid) {
+                  ownerKnownIds.add(mappedLid);
+                  setBoundedCache(this.reverseLidMap, mappedLid, phone, 2000);
+                }
+              }
+            } catch {}
+          }
+
           const mappedSenderPhone =
             altSenderDigits ||
             this.getLidReverseMapping(rawSenderDigits) ||
@@ -3295,30 +3681,38 @@ export class WhatsAppManager {
             (linkedPhoneClean && linkedPhoneClean === '2349049979183') ||
             (botPhone && botPhone === '2349049979183')
           );
+          if (isSessionAdminAccount) {
+            ownerKnownIds.add('2349049979183');
+          }
 
-          const isOwner =
+          const candidateSenderIds = [
+            senderNum,
+            rawSenderDigits,
+            participantNum,
+            altSenderDigits,
+            mappedSenderPhone,
+          ].filter(Boolean);
+
+          // Also treat 1-on-1 self-chat (messaging your own number/LID) as owner
+          const isSelfDirectChat = !isGroup && Boolean(remoteDigits && ownerKnownIds.has(remoteDigits));
+
+          let isOwner =
             isFromMe ||
-            (botPhone && (senderNum === botPhone || rawSenderDigits === botPhone || participantNum === botPhone || altSenderDigits === botPhone)) ||
-            (linkedPhoneClean && (senderNum === linkedPhoneClean || rawSenderDigits === linkedPhoneClean || participantNum === linkedPhoneClean || altSenderDigits === linkedPhoneClean)) ||
-            (botLidNum && (senderNum === botLidNum || rawSenderDigits === botLidNum || participantNum === botLidNum)) ||
-            Boolean(mappedSenderPhone && botPhone && mappedSenderPhone === botPhone) ||
-            Boolean(mappedSenderPhone && linkedPhoneClean && mappedSenderPhone === linkedPhoneClean) ||
-            (isSessionAdminAccount && (
-              senderNum === '2349049979183' ||
-              rawSenderDigits === '2349049979183' ||
-              participantNum === '2349049979183' ||
-              altSenderDigits === '2349049979183' ||
-              mappedSenderPhone === '2349049979183'
-            ));
+            isSelfDirectChat ||
+            candidateSenderIds.some((id) => ownerKnownIds.has(id));
 
-          // Check if sender is a group administrator
+          // Check if sender is a group administrator & resolve LID mappings from group participants
           let isSenderAdmin = false;
           if (isGroup) {
             try {
-              const groupMeta = await this.getCachedGroupMetadata(sock, remoteJid);
+              // Fast path: check in-memory groupMetaCache first without blocking on network
+              let groupMeta = this.groupMetaCache.get(remoteJid)?.meta;
+              if (!groupMeta) {
+                groupMeta = await this.getCachedGroupMetadata(sock, remoteJid);
+              }
               if (groupMeta?.participants) {
                 const senderLidPhone = this.getLidReverseMapping(rawSenderDigits) || this.getLidReverseMapping(senderNum);
-                const senderIds = new Set([senderNum, rawSenderDigits, altSenderDigits, participantNum, senderLidPhone, mappedSenderPhone].filter(Boolean));
+                const senderIds = new Set([...candidateSenderIds, senderLidPhone].filter(Boolean));
                 const participantJid = msg.key.participant || senderJid;
                 const p = groupMeta.participants.find(
                   (x: any) => {
@@ -3331,15 +3725,36 @@ export class WhatsAppManager {
                     return participantIds.some((id: string) => senderIds.has(id));
                   }
                 );
-                isSenderAdmin = p?.admin === 'admin' || p?.admin === 'superadmin';
+                if (p) {
+                  const pIds = [p.id, p.phoneNumber, p.lid]
+                    .filter((value: any) => typeof value === 'string')
+                    .map((value: string) => value.split('@')[0].split(':')[0].replace(/\D/g, ''))
+                    .filter(Boolean);
 
-                // Reverse map participant LID if it matches bot phone
-                if (p && (p.phoneNumber === botPhone || p.id?.replace(/\D/g, '') === botPhone || p.id?.replace(/\D/g, '') === linkedPhoneClean)) {
-                  if (p.lid) {
-                    const cleanL = p.lid.split('@')[0].split(':')[0].replace(/\D/g, '');
-                    const cleanP = (p.phoneNumber || p.id).split('@')[0].split(':')[0].replace(/\D/g, '');
-                    if (cleanL && cleanP) setBoundedCache(this.reverseLidMap, cleanL, cleanP, 2000);
+                  if (pIds.some((id) => ownerKnownIds.has(id))) {
+                    isOwner = true;
+                    for (const id of pIds) ownerKnownIds.add(id);
                   }
+
+                  const cleanL = (p.lid || (String(p.id || '').endsWith('@lid') ? p.id : '')).split('@')[0].split(':')[0].replace(/\D/g, '');
+                  const cleanP = (p.phoneNumber || (!String(p.id || '').endsWith('@lid') ? p.id : '')).split('@')[0].split(':')[0].replace(/\D/g, '');
+                  if (cleanL && cleanP) {
+                    setBoundedCache(this.reverseLidMap, cleanL, cleanP, 2000);
+                    if (ownerKnownIds.has(cleanP)) {
+                      isOwner = true;
+                      ownerKnownIds.add(cleanL);
+                    }
+                  }
+                }
+                const cachedGroupEntry = this.cachedGroups.find((g) => g.id === remoteJid);
+                isSenderAdmin =
+                  p?.admin === 'admin' ||
+                  p?.admin === 'superadmin' ||
+                  (isOwner && (this.isBotAdminInGroup(groupMeta) || Boolean(cachedGroupEntry?.isAdmin || cachedGroupEntry?.isBotAdmin)));
+              } else if (isOwner) {
+                const cachedGroup = this.cachedGroups.find((g) => g.id === remoteJid);
+                if (cachedGroup?.isAdmin || cachedGroup?.isBotAdmin) {
+                  isSenderAdmin = true;
                 }
               }
             } catch {}
@@ -3603,6 +4018,11 @@ export class WhatsAppManager {
           // Command handling: Prefix '.'
           const cleanCmdText = text.trim();
           if (cleanCmdText.startsWith('.')) {
+            const parts = cleanCmdText.slice(1).trim().split(/\s+/);
+            const command = parts[0]?.toLowerCase() || '';
+            const args = parts.slice(1);
+            if (!command) return;
+
             // Deduplicate command execution per message key ID (prevents double-execution on notify + append)
             const cmdMsgId = msg.key.id || '';
             if (cmdMsgId) {
@@ -3613,125 +4033,268 @@ export class WhatsAppManager {
               setBoundedCache(this.processedCommandMsgIds, cmdMsgId, Date.now(), 500);
             }
 
-            // STRICT LICENSE DURATION & EXPIRATION CHECK:
-            // Once license or free trial elapses, all commands are strictly blocked
-            if (this.isLicenseExpired()) {
-              console.log(`[License Enforcement] User ${this.userId} license has expired! Blocking command execution.`);
-              if (isOwner) {
-                try {
-                  await sock.sendMessage(remoteJid, {
-                    text: `⛔ *[SOLVATECH LICENSE EXPIRED]* ⛔\n\nYour active bot license duration has finished.\nAll commands and automation have been paused.\n\n👉 Please visit the website to renew your license key or contact Solomon Oladimeji (+234 904 997 9183).`,
-                  }, { quoted: msg });
-                } catch {}
-              }
-              return;
-            }
-
-            const parts = cleanCmdText.slice(1).trim().split(/\s+/);
-            const command = parts[0]?.toLowerCase();
-            const args = parts.slice(1);
-
-            const isGroupInfoCmd = command === 'groupinfo' || command === 'gcinfo' || command === 'group' || command === 'link';
             console.info(
               `[WhatsApp Command] .${command} received (${isGroup ? 'group' : 'direct'}, linked owner: ${Boolean(isOwner)}).`
             );
+
             // STRICT OWNER ISOLATION: The bot strictly listens ONLY to the person who linked it!
             if (!isOwner) {
               return;
             }
 
-            // O(1) per-account limiter: 5-command burst, then 4 commands/second.
-            // Commands that fit the bucket are never queued or delayed.
-            if (!this.commandRateLimiter.tryConsume()) {
-              const now = Date.now();
-              if (now - this.lastRateLimitNoticeAt >= 5000) {
-                this.lastRateLimitNoticeAt = now;
-                void sock.sendMessage(remoteJid, {
-                  text: '⌛ Command limit reached. You can run up to 4 commands per second, with a short burst of 5. Please retry shortly.',
-                }, { quoted: msg }).catch(() => {});
+            const cmdExecPerfStart = performance.now();
+            const resolvedChatName = isGroup
+              ? (this.groupSubjectCache.get(remoteJid) ||
+                 this.cachedGroups.find((g) => g.id === remoteJid)?.subject ||
+                 `Group (${remoteJid.split('@')[0]})`)
+              : `Direct Chat (+${remoteDigits || senderNum || botPhone || 'User'})`;
+            const resolvedSenderPhone = `+${mappedSenderPhone || senderNum || botPhone || linkedPhoneClean || 'Owner'}`;
+
+            const activeCmdLog = this.startCommandLog({
+              command,
+              fullText: cleanCmdText,
+              args,
+              sender: resolvedSenderPhone,
+              chatType: isGroup ? 'group' : 'direct',
+              chatName: resolvedChatName,
+              remoteJid,
+            });
+
+            let cmdLogStatus: 'completed' | 'error' = 'completed';
+            let cmdReplyPreview = '';
+            let cmdErrorMessage: string | undefined;
+
+            // Wrap sock.sendMessage in a local proxy so every command reply is reliably delivered & captured for real-time telemetry
+            const rawSock = sock;
+            const self = this;
+            const instrumentedSock = new Proxy(rawSock, {
+              get(target, prop, receiver) {
+                if (prop === 'sendMessage') {
+                  return async (jid: string, content: any, options?: any) => {
+                    const isReaction = Boolean(content && typeof content === 'object' && content.react);
+                    const previewText = !isReaction && content && typeof content === 'object'
+                      ? (content.text ||
+                         content.caption ||
+                         (content.pin ? '📌 Pinned message for 7 days' : '') ||
+                         (content.delete ? '🗑️ Deleted target message' : '') ||
+                         (content.audio ? '🎵 Sent audio stream' : '') ||
+                         (content.video ? '🎬 Sent video media' : '') ||
+                         (content.image ? '🖼️ Sent image media' : '') ||
+                         (content.sticker ? '✨ Sent sticker' : ''))
+                      : '';
+
+                    // Reactions: fire with fast 3.5s timeout and never block or throw
+                    if (isReaction) {
+                      return Promise.race([
+                        target.sendMessage(jid, content, options),
+                        new Promise((resolve) => setTimeout(() => resolve(undefined), 3500)),
+                      ]).catch(() => undefined);
+                    }
+
+                    // Normalize quoted message key for group chats so WhatsApp clients never drop quoted group replies
+                    let normalizedOptions = options;
+                    if (jid.endsWith('@g.us') && options?.quoted?.key && !options.quoted.key.participant) {
+                      const fallbackParticipant =
+                        msg.key.participant ||
+                        (botUserLid ? (botUserLid.includes('@') ? botUserLid : `${botUserLid}@lid`) : '') ||
+                        (botPhone ? `${botPhone}@s.whatsapp.net` : '');
+                      if (fallbackParticipant) {
+                        normalizedOptions = {
+                          ...options,
+                          quoted: {
+                            ...options.quoted,
+                            key: {
+                              ...options.quoted.key,
+                              participant: fallbackParticipant,
+                            },
+                          },
+                        };
+                      }
+                    }
+
+                    try {
+                      // Pre-warm group metadata into cache before sending to group so Baileys never stalls on groupMetadata
+                      if (jid.endsWith('@g.us') && !self.groupMetaCache.has(jid)) {
+                        await self.getCachedGroupMetadata(target, jid, false).catch(() => {});
+                      }
+                      const sentResult = await Promise.race([
+                        target.sendMessage(jid, content, normalizedOptions),
+                        new Promise<never>((_, reject) =>
+                          setTimeout(() => reject(new Error('WhatsApp sendMessage timeout')), 8000)
+                        ),
+                      ]);
+                      if (previewText) {
+                        cmdReplyPreview = String(previewText);
+                      }
+                      return sentResult;
+                    } catch (firstSendErr: any) {
+                      // If sending to a group failed or timed out (e.g. stale sender-key or rejected quoted stanza),
+                      // repair the group sender-key and immediately retry without quoted options so the reply always lands in the group!
+                      if (jid.endsWith('@g.us') && content && !content.delete && !content.pin) {
+                        console.warn(`[WhatsApp Group Send Recovery (${self.userId})] Retrying group reply in ${jid} after error: ${firstSendErr?.message || firstSendErr}`);
+                        await self.clearGroupSenderKey(jid);
+                        const retryResult = await Promise.race([
+                          target.sendMessage(jid, content),
+                          new Promise<never>((_, reject) =>
+                            setTimeout(() => reject(new Error('WhatsApp group retry timeout')), 8000)
+                          ),
+                        ]);
+                        if (previewText) {
+                          cmdReplyPreview = String(previewText);
+                        }
+                        return retryResult;
+                      }
+                      throw firstSendErr;
+                    }
+                  };
+                }
+                const val = Reflect.get(target, prop, receiver);
+                return typeof val === 'function' ? val.bind(target) : val;
+              },
+            });
+            const sockRef = instrumentedSock;
+            let reactWorkingTimer: NodeJS.Timeout | null = null;
+
+            try {
+              const sock = sockRef;
+
+              // STRICT LICENSE DURATION & EXPIRATION CHECK:
+              // Once license or free trial elapses, all commands are strictly blocked
+              if (this.isLicenseExpired()) {
+                console.log(`[License Enforcement] User ${this.userId} license has expired! Blocking command execution.`);
+                cmdLogStatus = 'error';
+                cmdErrorMessage = 'License expired';
+                try {
+                  await sock.sendMessage(remoteJid, {
+                    text: `⛔ *[SOLVATECH LICENSE EXPIRED]* ⛔\n\nYour active bot license duration has finished.\nAll commands and automation have been paused.\n\n👉 Please visit the website to renew your license key or contact Solomon Oladimeji (+234 904 997 9183).`,
+                  }, { quoted: msg });
+                } catch {}
+                return;
               }
-              return;
-            }
 
-            const isGroupCmd = GROUP_ONLY_COMMANDS.has(command);
+              const isGroupCmd = GROUP_ONLY_COMMANDS.has(command);
+              // Allow policy configuration/inspection commands (.anti, .antilink, .antibot, .antistatus, .antispam, .autowelcome, .autogoodbye, .warnlimit) to work for the Bot Owner in any group or DM
+              const isPortablePolicyCmd = [
+                'anti',
+                'antilink',
+                'antibot',
+                'antistatus',
+                'antispam',
+                'autowelcome',
+                'welcome',
+                'autogoodbye',
+                'goodbye',
+                'warnlimit',
+              ].includes(command);
 
-            // 1v1 private chats: strictly bot owner only. Group commands never execute in 1v1 chat.
-            if (!isGroup && isGroupCmd) {
-              return;
-            }
+              if (!isGroup && isGroupCmd && !isPortablePolicyCmd) {
+                await sock.sendMessage(remoteJid, {
+                  text: `ℹ️ *[GROUP COMMAND: .${command}]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\nThis command manages WhatsApp group members or group settings.\n👉 Send *.${command}* inside any WhatsApp group where your bot is active!`,
+                }, { quoted: msg }).catch(() => {});
+                return;
+              }
 
-            // Group chats:
-            // Admin moderation commands (.kick, .warn, .lock, etc.) require the bot owner to ALSO be a group admin in WhatsApp!
-            if (isGroup && ADMIN_ONLY_GROUP_COMMANDS.has(command)) {
-              // Re-check current WhatsApp roles for every privileged command; cached roles can go stale after a demotion.
-              const freshMeta = await this.getCachedGroupMetadata(sock, remoteJid, true);
-              const actorIds = new Set(
-                [
+              // Policy inspection & configuration commands (.anti, .antilink, .antibot, etc.) are always authorized for the linked Bot Owner
+              if (isOwner && isPortablePolicyCmd) {
+                isAuthorizedAdmin = true;
+              }
+
+              // Group chats:
+              // Admin moderation commands (.kick, .warn, .lock, etc.) require the bot owner to ALSO be a group admin in WhatsApp!
+              if (isGroup && ADMIN_ONLY_GROUP_COMMANDS.has(command) && !isPortablePolicyCmd) {
+                const cachedGroupEntry = this.cachedGroups.find((g) => g.id === remoteJid);
+                const cachedGroupAdmin = Boolean(cachedGroupEntry?.isAdmin || cachedGroupEntry?.isBotAdmin);
+                if (isAuthorizedAdmin || (isOwner && cachedGroupAdmin)) {
+                  isAuthorizedAdmin = true;
+                } else {
+                  const freshMeta = await this.getCachedGroupMetadata(sock, remoteJid, false);
+                  const actorIds = new Set(
+                    [
+                      senderNum,
+                      participantNum,
+                      mappedSenderPhone,
+                      botPhone,
+                      botLidNum,
+                      linkedPhoneClean,
+                    ]
+                      .filter(Boolean)
+                      .map((value) => String(value).replace(/\D/g, '')),
+                  );
+                  const currentSender = freshMeta?.participants?.find((participant: any) =>
+                    [participant.id, participant.phoneNumber, participant.lid]
+                      .filter((value: unknown): value is string => typeof value === 'string')
+                      .some((value: string) => {
+                        if (value === senderJid || value === participantRaw) return true;
+                        const clean = value.split('@')[0].split(':')[0].replace(/\D/g, '');
+                        const mapped = this.getLidReverseMapping(clean);
+                        return actorIds.has(clean) || Boolean(mapped && actorIds.has(mapped));
+                      })
+                  );
+                  const isBotAdmin = freshMeta ? this.isBotAdminInGroup(freshMeta) : cachedGroupAdmin;
+                  isSenderAdmin = Boolean(
+                    currentSender?.admin === 'admin' ||
+                    currentSender?.admin === 'superadmin' ||
+                    isBotAdmin ||
+                    cachedGroupAdmin
+                  );
+                  isAuthorizedAdmin = Boolean(isOwner && isSenderAdmin);
+                  if (!isAuthorizedAdmin) {
+                    cmdLogStatus = 'error';
+                    cmdErrorMessage = 'Requires group admin privileges';
+                    await sock.sendMessage(remoteJid, {
+                      text: '⛔ This action requires your linked WhatsApp account to be a Group Administrator in this group.',
+                    }, { quoted: msg }).catch(() => {});
+                    return;
+                  }
+                }
+              }
+
+              // Determine bot user's private DM chat
+              const myDigits = (sock.user?.id || '').split(':')[0].split('@')[0].replace(/\D/g, '');
+              const linkedDigits = (this.currentStatus.user?.phone || '').replace(/\D/g, '');
+              const participantDigits = (msg.key.participant || '').split(':')[0].split('@')[0].replace(/\D/g, '');
+              const botOwnerDigits = myDigits || linkedDigits || (!isFromMe ? participantDigits : '') || (isSessionAdminAccount ? '2349049979183' : (senderNum || ''));
+              const userPrivateDm = `${botOwnerDigits}@s.whatsapp.net`;
+              // STRICT RULE: All decrypted view-once media goes strictly to Personal DM (chat with self), even in 1v1 chats!
+              const targetDm = userPrivateDm;
+
+              // Track recent admin/owner group commands to monitor for rogue foreign bot piggybacking
+              if (isGroup && (isOwner || isSenderAdmin)) {
+                this.recentAdminGroupCommands.set(remoteJid, {
+                  command,
+                  rawText: cleanCmdText,
+                  issuedAt: Date.now(),
+                  messageKeyId: msg.key.id || '',
+                  senderJid,
                   senderNum,
-                  participantNum,
-                  mappedSenderPhone,
-                  ...(isFromMe ? [botPhone, botLidNum, linkedPhoneClean] : []),
-                ]
-                  .filter(Boolean)
-                  .map((value) => String(value).replace(/\D/g, '')),
-              );
-              const currentSender = freshMeta?.participants?.find((participant: any) =>
-                [participant.id, participant.phoneNumber, participant.lid]
-                  .filter((value: unknown): value is string => typeof value === 'string')
-                  .some((value: string) => {
-                    if (value === senderJid || value === participantRaw) return true;
-                    const clean = value.split('@')[0].split(':')[0].replace(/\D/g, '');
-                    const mapped = this.getLidReverseMapping(clean);
-                    return actorIds.has(clean) || Boolean(mapped && actorIds.has(mapped));
-                  })
-              );
-              isSenderAdmin = Boolean(
-                currentSender?.admin === 'admin' || currentSender?.admin === 'superadmin',
-              );
-              isAuthorizedAdmin = Boolean(isOwner && isSenderAdmin);
-              if (!isAuthorizedAdmin) {
-                await sock.sendMessage(remoteJid, {
-                  text: '⛔ This action requires the linked WhatsApp account to be a current group admin. No change was made.',
-                }, { quoted: msg }).catch(() => {});
-                return;
+                });
               }
 
-              // Check the linked bot account's role from the same fresh WhatsApp metadata.
-              const isBotAdmin = freshMeta ? this.isBotAdminInGroup(freshMeta) : false;
-              if (!isBotAdmin) {
-                await sock.sendMessage(remoteJid, {
-                  text: `⚠️ *[BOT NOT ADMIN]*\nThe bot must be promoted to Group Administrator to execute group management commands.`,
-                }, { quoted: msg }).catch(() => {});
-                return;
-              }
-            }
+              // Smart reaction indicators: only send ⚡ if command takes >350ms so fast commands never collide with group reply encryption!
+              const clearWorkingTimer = () => {
+                if (reactWorkingTimer) {
+                  clearTimeout(reactWorkingTimer);
+                  reactWorkingTimer = null;
+                }
+              };
+              reactWorkingTimer = setTimeout(() => {
+                reactWorkingTimer = null;
+                sock.sendMessage(remoteJid, { react: { text: '⚡', key: msg.key } }).catch(() => {});
+              }, 350);
 
-            // Determine bot user's private DM chat
-            const myDigits = (sock.user?.id || '').split(':')[0].split('@')[0].replace(/\D/g, '');
-            const linkedDigits = (this.currentStatus.user?.phone || '').replace(/\D/g, '');
-            const participantDigits = (msg.key.participant || '').split(':')[0].split('@')[0].replace(/\D/g, '');
-            const botOwnerDigits = myDigits || linkedDigits || (!isFromMe ? participantDigits : '') || (isSessionAdminAccount ? '2349049979183' : (senderNum || ''));
-            const userPrivateDm = `${botOwnerDigits}@s.whatsapp.net`;
-            // STRICT RULE: All decrypted view-once media goes strictly to Personal DM (chat with self), even in 1v1 chats!
-            const targetDm = userPrivateDm;
-
-            // Track recent admin/owner group commands to monitor for rogue foreign bot piggybacking
-            if (isGroup && (isOwner || isSenderAdmin)) {
-              this.recentAdminGroupCommands.set(remoteJid, {
-                command,
-                rawText: cleanCmdText,
-                issuedAt: Date.now(),
-                messageKeyId: msg.key.id || '',
-                senderJid,
-                senderNum,
-              });
-            }
-
-            // Flash-fast instant reaction indicator: ⚡ while processing, ✅ on completion, ❌ on error
-            sock.sendMessage(remoteJid, { react: { text: '⚡', key: msg.key } }).catch(() => {});
-            const reactDone = () => sock.sendMessage(remoteJid, { react: { text: '✅', key: msg.key } }).catch(() => {});
-            const reactError = () => sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } }).catch(() => {});
-            const reactClear = () => sock.sendMessage(remoteJid, { react: { text: '', key: msg.key } }).catch(() => {});
+              const reactDone = () => {
+                clearWorkingTimer();
+                return sock.sendMessage(remoteJid, { react: { text: '✅', key: msg.key } }).catch(() => {});
+              };
+              const reactError = () => {
+                clearWorkingTimer();
+                cmdLogStatus = 'error';
+                return sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } }).catch(() => {});
+              };
+              const reactClear = () => {
+                clearWorkingTimer();
+                return sock.sendMessage(remoteJid, { react: { text: '', key: msg.key } }).catch(() => {});
+              };
 
 
             // 1. .open / .vv (View-Once Decryptor -> Private DM + Auto-delete trigger)
@@ -4568,6 +5131,9 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
               } catch (err: any) {
                 reactError();
                 console.error('Failed to lock group:', err);
+                await sock.sendMessage(remoteJid, {
+                  text: `⚠️ *[LOCK ERROR]*\nFailed to lock group: ${err?.message || 'Ensure bot account is a Group Administrator'}.`,
+                }, { quoted: msg }).catch(() => {});
               }
               return;
             }
@@ -4584,22 +5150,26 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
               } catch (err: any) {
                 reactError();
                 console.error('Failed to unlock group:', err);
+                await sock.sendMessage(remoteJid, {
+                  text: `⚠️ *[UNLOCK ERROR]*\nFailed to unlock group: ${err?.message || 'Ensure bot account is a Group Administrator'}.`,
+                }, { quoted: msg }).catch(() => {});
               }
               return;
             }
 
             // 17. .antilink (Toggle Anti-Link defense)
             if (command === 'antilink') {
-              if (!isGroup || !isAuthorizedAdmin) return;
+              if (!isOwner && !isAuthorizedAdmin) return;
               try {
                 const val = args[0]?.toLowerCase() === 'off' ? false : true;
                 await commandHandler.setSecuritySetting(remoteJid, 'antilink', val, this.userId);
-                reactDone();
                 await sock.sendMessage(remoteJid, {
                   text: `🛡️ *[ANTI-LINK SYSTEM]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\nStatus: ${val ? '✅ *ENABLED & ENFORCED*' : '❌ *DISABLED*'}\nPolicy: Unauthorized external links will be auto-deleted with security warning issued to sender.\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚡ _SOLVATECH Group Defense_`,
                 }, { quoted: msg });
+                reactDone();
               } catch (err: any) {
                 reactError();
+                cmdErrorMessage = err?.message || 'Failed to send anti-link reply';
                 console.error('Failed to configure anti-link:', err);
               }
               return;
@@ -4607,16 +5177,17 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
 
             // 18. .antibot (Toggle Anti-Bot defense)
             if (command === 'antibot') {
-              if (!isGroup || !isAuthorizedAdmin) return;
+              if (!isOwner && !isAuthorizedAdmin) return;
               try {
                 const val = args[0]?.toLowerCase() === 'off' ? false : true;
                 await commandHandler.setSecuritySetting(remoteJid, 'antibot', val, this.userId);
-                reactDone();
                 await sock.sendMessage(remoteJid, {
                   text: `🤖 *[ANTI-BOT SYSTEM]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\nStatus: ${val ? '✅ *ENABLED & ENFORCED*' : '❌ *DISABLED*'}\nPolicy: Non-admin members using bot prefix commands (*.*) will have their message auto-deleted and receive a security warning.\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚡ _SOLVATECH Group Defense_`,
                 }, { quoted: msg });
+                reactDone();
               } catch (err: any) {
                 reactError();
+                cmdErrorMessage = err?.message || 'Failed to send anti-bot reply';
                 console.error('Failed to configure anti-bot:', err);
               }
               return;
@@ -4624,16 +5195,17 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
 
             // 19. .antistatus (Toggle Anti-Status Mentions defense)
             if (command === 'antistatus') {
-              if (!isGroup || !isAuthorizedAdmin) return;
+              if (!isOwner && !isAuthorizedAdmin) return;
               try {
                 const val = args[0]?.toLowerCase() === 'off' ? false : true;
                 await commandHandler.setSecuritySetting(remoteJid, 'antistatus', val, this.userId);
-                reactDone();
                 await sock.sendMessage(remoteJid, {
                   text: `📱 *[ANTI-STATUS MENTION SYSTEM]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\nStatus: ${val ? '✅ *ENABLED & ENFORCED*' : '❌ *DISABLED*'}\nPolicy: Non-admin members mentioning this group in their personal WhatsApp status will have the alert deleted and receive a security warning.\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚡ _SOLVATECH Group Defense_`,
                 }, { quoted: msg });
+                reactDone();
               } catch (err: any) {
                 reactError();
+                cmdErrorMessage = err?.message || 'Failed to send anti-status reply';
                 console.error('Failed to configure anti-status:', err);
               }
               return;
@@ -4641,50 +5213,53 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
 
             // 20. .antispam (Toggle Anti-Spam defense)
             if (command === 'antispam') {
-              if (!isGroup || !isAuthorizedAdmin) return;
+              if (!isOwner && !isAuthorizedAdmin) return;
               try {
                 const val = args[0]?.toLowerCase() === 'off' ? false : true;
                 await commandHandler.setSecuritySetting(remoteJid, 'antispam', val, this.userId);
-                reactDone();
                 await sock.sendMessage(remoteJid, {
                   text: `🚫 *[ANTI-SPAM DEFENSE SYSTEM]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\nStatus: ${val ? '✅ *ENABLED & ENFORCED*' : '❌ *DISABLED*'}\nPolicy: Flood messages, rapid stickers/media spam, and repetitive text/words will be automatically purged (including original spam messages). If a member continues sending messages while deletion is underway, they are *INSTANTLY KICKED*!\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚡ _SOLVATECH Group Defense_`,
                 }, { quoted: msg });
+                reactDone();
               } catch (err: any) {
                 reactError();
+                cmdErrorMessage = err?.message || 'Failed to send anti-spam reply';
                 console.error('Failed to configure anti-spam:', err);
               }
               return;
             }
 
-            // 21. .autowelcome (Toggle Auto-Welcome for joining members - Strictly Admin Only)
-            if (command === 'autowelcome') {
-              if (!isGroup || !isAuthorizedAdmin) return;
+            // 21. .autowelcome (Toggle Auto-Welcome for joining members)
+            if (command === 'autowelcome' || command === 'welcome') {
+              if (!isOwner && !isAuthorizedAdmin) return;
               try {
                 const val = args[0]?.toLowerCase() === 'off' ? false : true;
                 await commandHandler.setSecuritySetting(remoteJid, 'autowelcome', val, this.userId);
-                reactDone();
                 await sock.sendMessage(remoteJid, {
                   text: `👋 *[AUTO-WELCOME SYSTEM]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\nStatus: ${val ? '✅ *ENABLED*' : '❌ *DISABLED*'}\nPolicy: Automatically greets anyone who enters the group.\nRule: Strictly sent only by connected admin bots.\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚡ _SOLVATECH Group Defense_`,
                 }, { quoted: msg });
+                reactDone();
               } catch (err: any) {
                 reactError();
+                cmdErrorMessage = err?.message || 'Failed to send auto-welcome reply';
                 console.error('Failed to configure auto-welcome:', err);
               }
               return;
             }
 
-            // 22. .autogoodbye (Toggle Auto-Goodbye for departing members - Strictly Admin Only)
-            if (command === 'autogoodbye') {
-              if (!isGroup || !isAuthorizedAdmin) return;
+            // 22. .autogoodbye (Toggle Auto-Goodbye for departing members)
+            if (command === 'autogoodbye' || command === 'goodbye') {
+              if (!isOwner && !isAuthorizedAdmin) return;
               try {
                 const val = args[0]?.toLowerCase() === 'off' ? false : true;
                 await commandHandler.setSecuritySetting(remoteJid, 'autogoodbye', val, this.userId);
-                reactDone();
                 await sock.sendMessage(remoteJid, {
                   text: `🚪 *[AUTO-GOODBYE SYSTEM]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\nStatus: ${val ? '✅ *ENABLED*' : '❌ *DISABLED*'}\nPolicy: Automatically acknowledges departing or removed participants.\nRule: Strictly sent only by connected admin bots.\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚡ _SOLVATECH Group Defense_`,
                 }, { quoted: msg });
+                reactDone();
               } catch (err: any) {
                 reactError();
+                cmdErrorMessage = err?.message || 'Failed to send auto-goodbye reply';
                 console.error('Failed to configure auto-goodbye:', err);
               }
               return;
@@ -4694,19 +5269,9 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
             // STRICT RULE: All warns commands can only be used by admin connected to bot. Member can NEVER use .warn!
             // Admin cannot be warned by admin. Quoted message (pic, sticker, text, etc.) is auto-magically deleted.
             if (['warn', 'warnlimit', 'warns', 'unwarn', 'clearwarns', 'resetwarns'].includes(command)) {
-              if (!isGroup || !isAuthorizedAdmin) return;
+              if (isGroup && !isAuthorizedAdmin && command !== 'warnlimit') return;
 
               try {
-                const groupMeta = await this.getCachedGroupMetadata(sock, remoteJid);
-                const senderParticipant = groupMeta?.participants?.find(
-                  (p: any) => p.id.replace(/\D/g, '') === senderNum || p.id === senderJid
-                );
-                const isSenderAdminLocal = senderParticipant?.admin === 'admin' || senderParticipant?.admin === 'superadmin' || isAuthorizedAdmin;
-
-                if (!isSenderAdminLocal) {
-                  return;
-                }
-
                 // A) Setting unified warning limit: .warn limit <number> or .warnlimit <number>
                 const firstArg = args[0]?.toLowerCase();
                 if (command === 'warnlimit' || firstArg === 'limit' || firstArg === 'max' || firstArg === 'set') {
@@ -4720,10 +5285,20 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
                     return;
                   }
                   await commandHandler.setWarnLimit(remoteJid, num, this.userId);
-                  reactDone();
                   await sock.sendMessage(remoteJid, {
                     text: `⚙️ *[WARN LIMIT UPDATED]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\nGroup warning limit set to *${num} warnings*.\nAccumulating ${num} warnings across Anti-Bot, Anti-Link, Anti-Status, Anti-Spam, or Admin warnings will automatically kick the member.\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚡ _SOLVATECH Group Defense_`,
                   }, { quoted: msg });
+                  reactDone();
+                  return;
+                }
+
+                const groupMeta = await this.getCachedGroupMetadata(sock, remoteJid);
+                const senderParticipant = groupMeta?.participants?.find(
+                  (p: any) => p.id.replace(/\D/g, '') === senderNum || p.id === senderJid
+                );
+                const isSenderAdminLocal = senderParticipant?.admin === 'admin' || senderParticipant?.admin === 'superadmin' || isAuthorizedAdmin;
+
+                if (!isSenderAdminLocal) {
                   return;
                 }
 
@@ -4744,11 +5319,11 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
                   const targetClean = targetJid.split('@')[0].replace(/\D/g, '');
                   const count = commandHandler.getWarnings(remoteJid, targetJid);
                   const max = commandHandler.getSecuritySettings(remoteJid, this.userId).warnLimit || 3;
-                  reactDone();
                   await sock.sendMessage(remoteJid, {
                     text: `📋 *[GROUP WARNING STATUS]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n👤 *Participant:* @${targetClean}\n⚠️ *Current Warnings:* ${count} / ${max}\nStatus: ${count >= max ? '🚨 Removal Limit Exceeded' : `${max - count} warnings remaining before auto-kick`}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n> 🛡️ _SOLVATECH Group Defense_`,
                     mentions: [targetJid],
                   }, { quoted: msg });
+                  reactDone();
                   return;
                 }
 
@@ -4768,21 +5343,21 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
                   }
                   const targetClean = targetJid.split('@')[0].replace(/\D/g, '');
                   await commandHandler.clearWarnings(remoteJid, targetJid);
-                  reactDone();
                   await sock.sendMessage(remoteJid, {
                     text: `✅ *[WARNINGS RESET]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\nWarnings have been reset to *0* for @${targetClean}.\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n> 🛡️ _SOLVATECH Group Defense_`,
                     mentions: [targetJid],
                   }, { quoted: msg });
+                  reactDone();
                   return;
                 }
 
                 // D) Reset all warnings for group: .resetwarns
                 if (command === 'resetwarns') {
                   await commandHandler.resetAllWarnings(remoteJid);
-                  reactDone();
                   await sock.sendMessage(remoteJid, {
                     text: `🔄 *[ALL WARNINGS CLEARED]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\nAll group member warnings have been reset to 0 for this group.\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n> 🛡️ _SOLVATECH Group Defense_`,
                   }, { quoted: msg });
+                  reactDone();
                   return;
                 }
 
@@ -4865,39 +5440,74 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
                       console.error('Failed to kick warned user:', kickErr);
                     }
 
-                    reactDone();
                     await sock.sendMessage(remoteJid, {
                       text: `🚨 *[SECURITY WARNING LIMIT REACHED]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n👤 *Offender:* @${targetClean}\n👮 *Issued By:* Admin @${senderNum}\nMessage has been deleted because admin warned you.\n⚠️ *Warnings:* *${warnResult.count} / ${warnResult.max} (LIMIT REACHED)*\n🔨 *Punishment:* ${kickSuccess ? '*Member ejected from group immediately!*' : '*Threshold reached (Bot requires admin privileges to kick)*'}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚡ _SOLVATECH Group Defense_`,
                       mentions: [targetInGroup.id],
                     }, { quoted: msg });
-                  } else {
                     reactDone();
+                  } else {
                     await sock.sendMessage(remoteJid, {
                       text: `⚠️ *[ADMIN WARNING]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n👤 *Member:* @${targetClean}\n👮 *Issued By:* Admin @${senderNum}\nMessage has been deleted because admin warned you.\n📝 *Reason:* ${reason}\n📊 *Warning:* *${warnResult.count} / ${warnResult.max}*\n⏳ *Warnings Remaining:* *${warnResult.max - warnResult.count}* before automatic kick.\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚡ _SOLVATECH Group Defense_`,
                       mentions: [targetInGroup.id, senderParticipant?.id || senderJid],
                     }, { quoted: msg });
+                    reactDone();
                   }
                   return;
                 }
               } catch (err: any) {
                 reactError();
+                cmdErrorMessage = err?.message || 'Warn command error';
                 console.error('[Warn Error]:', err);
                 return;
               }
             }
 
-            // 24. .anti (Inspect group protection matrix - Admin connected to bot only)
+            // 24. .anti (Inspect or toggle group protection matrix)
             if (command === 'anti') {
-              if (!isGroup || !isAuthorizedAdmin) return;
-              const sec = commandHandler.getSecuritySettings(remoteJid, this.userId);
-              reactDone();
-              await sock.sendMessage(
-                remoteJid,
-                {
-                  text: `╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮\n┃  🛡️ *SOLVATECH GROUP DEFENSE MATRIX* 🛡️  ┃\n╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n\n*STATUS:*  🟢 *ARMED & ENFORCED*\n*ACCESS:*  👑 *ADMINISTRATORS ONLY*\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🛡️ *ACTIVE SHIELD POLICIES*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🌐 *ANTI-LINK SYSTEM:*\n   ► *STATUS:* ${sec.antilink ? '🟢 *ENABLED & ENFORCED*' : '🔴 *DISABLED*'}\n   ► *POLICY:* *Auto-delete link + 1 Security Warning*\n\n🤖 *ANTI-BOT SYSTEM:*\n   ► *STATUS:* ${sec.antibot ? '🟢 *ENABLED & ENFORCED*' : '🔴 *DISABLED*'}\n   ► *POLICY:* *Auto-purge member prefix commands + Warning*\n\n📱 *ANTI-STATUS MENTIONS:*\n   ► *STATUS:* ${sec.antistatus ? '🟢 *ENABLED & ENFORCED*' : '🔴 *DISABLED*'}\n   ► *POLICY:* *Block group status mentions + Warning*\n\n🚫 *ANTI-SPAM DEFENSE:*\n   ► *STATUS:* ${sec.antispam ? '🟢 *ENABLED & ENFORCED*' : '🔴 *DISABLED*'}\n   ► *POLICY:* *Auto-purge flood messages + INSTANT KICK*\n\n👋 *AUTO-WELCOME:*\n   ► *STATUS:* ${sec.autowelcome ? '🟢 *ENABLED (ADMIN BOT)*' : '🔴 *DISABLED*'}\n   ► *POLICY:* *Contextual welcome greeting to new members*\n\n🚪 *AUTO-GOODBYE:*\n   ► *STATUS:* ${sec.autogoodbye ? '🟢 *ENABLED (ADMIN BOT)*' : '🔴 *DISABLED*'}\n   ► *POLICY:* *Departure acknowledgments*\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚙️ *WARNING & PUNISHMENT RULES*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚠️ *WARNING LIMIT:* *${sec.warnLimit || 3} WARNINGS*\n🔨 *ENFORCEMENT:* *AUTOMATIC KICK AT STRIKE ${sec.warnLimit || 3}*\n🗑️ *OFFENDING MEDIA:* *Auto-deleted on warning (pics/stickers/text)*\n\n> 🛡️ *SOLVATECH AUTOMATED ENGINE* • _24/7 Group Defense_`,
-                },
-                { quoted: msg }
-              );
+              if (!isOwner && !isAuthorizedAdmin) return;
+              try {
+                const subArg = args[0]?.toLowerCase();
+                if (subArg === 'on' || subArg === 'off') {
+                  const val = subArg === 'on';
+                  await commandHandler.setSecuritySetting(remoteJid, 'antilink', val, this.userId);
+                  await sock.sendMessage(
+                    remoteJid,
+                    {
+                      text: `🛡️ *[ANTI-LINK SYSTEM]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\nStatus: ${val ? '✅ *ENABLED & ENFORCED*' : '❌ *DISABLED*'}\nPolicy: Unauthorized external links will be auto-deleted with security warning issued to sender.\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚡ _SOLVATECH Group Defense_`,
+                    },
+                    { quoted: msg }
+                  );
+                  reactDone();
+                  return;
+                }
+                if (subArg === 'all') {
+                  const val = args[1]?.toLowerCase() !== 'off';
+                  await commandHandler.toggleAllForGroup(remoteJid, val, this.userId);
+                  await sock.sendMessage(
+                    remoteJid,
+                    {
+                      text: `🛡️ *[ALL GROUP DEFENSES ${val ? 'ENABLED' : 'DISABLED'}]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n• Anti-Link: *${val ? '✅ ON' : '❌ OFF'}*\n• Anti-Bot: *${val ? '✅ ON' : '❌ OFF'}*\n• Anti-Status: *${val ? '✅ ON' : '❌ OFF'}*\n• Anti-Spam: *${val ? '✅ ON' : '❌ OFF'}*\n• Auto-Welcome: *${val ? '✅ ON' : '❌ OFF'}*\n• Auto-Goodbye: *${val ? '✅ ON' : '❌ OFF'}*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚡ _SOLVATECH Group Defense_`,
+                    },
+                    { quoted: msg }
+                  );
+                  reactDone();
+                  return;
+                }
+
+                const sec = commandHandler.getSecuritySettings(remoteJid, this.userId);
+                await sock.sendMessage(
+                  remoteJid,
+                  {
+                    text: `╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮\n┃  🛡️ *SOLVATECH GROUP DEFENSE MATRIX* 🛡️  ┃\n╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n\n*STATUS:*  🟢 *ARMED & ENFORCED*\n*ACCESS:*  👑 *BOT OWNER / ADMIN*\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🛡️ *ACTIVE SHIELD POLICIES*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🌐 *ANTI-LINK SYSTEM:*\n   ► *STATUS:* ${sec.antilink ? '🟢 *ENABLED & ENFORCED*' : '🔴 *DISABLED*'}\n   ► *POLICY:* *Auto-delete link + 1 Security Warning*\n\n🤖 *ANTI-BOT SYSTEM:*\n   ► *STATUS:* ${sec.antibot ? '🟢 *ENABLED & ENFORCED*' : '🔴 *DISABLED*'}\n   ► *POLICY:* *Auto-purge member prefix commands + Warning*\n\n📱 *ANTI-STATUS MENTIONS:*\n   ► *STATUS:* ${sec.antistatus ? '🟢 *ENABLED & ENFORCED*' : '🔴 *DISABLED*'}\n   ► *POLICY:* *Block group status mentions + Warning*\n\n🚫 *ANTI-SPAM DEFENSE:*\n   ► *STATUS:* ${sec.antispam ? '🟢 *ENABLED & ENFORCED*' : '🔴 *DISABLED*'}\n   ► *POLICY:* *Auto-purge flood messages + INSTANT KICK*\n\n👋 *AUTO-WELCOME:*\n   ► *STATUS:* ${sec.autowelcome ? '🟢 *ENABLED (ADMIN BOT)*' : '🔴 *DISABLED*'}\n   ► *POLICY:* *Contextual welcome greeting to new members*\n\n🚪 *AUTO-GOODBYE:*\n   ► *STATUS:* ${sec.autogoodbye ? '🟢 *ENABLED (ADMIN BOT)*' : '🔴 *DISABLED*'}\n   ► *POLICY:* *Departure acknowledgments*\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚙️ *WARNING & PUNISHMENT RULES*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚠️ *WARNING LIMIT:* *${sec.warnLimit || 3} WARNINGS*\n🔨 *ENFORCEMENT:* *AUTOMATIC KICK AT STRIKE ${sec.warnLimit || 3}*\n🗑️ *OFFENDING MEDIA:* *Auto-deleted on warning (pics/stickers/text)*\n\n> 🛡️ *SOLVATECH AUTOMATED ENGINE* • _24/7 Group Defense_`,
+                  },
+                  { quoted: msg }
+                );
+                reactDone();
+              } catch (antiErr: any) {
+                reactError();
+                cmdErrorMessage = antiErr?.message || 'Failed to send .anti reply in group';
+                console.error('[.anti Command Error]:', antiErr);
+              }
               return;
             }
 
@@ -5123,21 +5733,13 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
                   }
                 }
               } else {
-                try {
-                  await sock.sendMessage(remoteJid, { text: finalText }, { quoted: msg });
-                } catch {
-                  await sock.sendMessage(remoteJid, { text: finalText }).catch(() => {});
-                }
+                await sock.sendMessage(remoteJid, { text: finalText }, { quoted: msg });
               }
               reactDone();
-              this.addNotification({
-                type: 'command',
-                title: `⚡ Command Executed: .${command}`,
-                body: `Executed for +${senderNum}. Response sent to WhatsApp chat.`,
-                sender: `+${senderNum}`,
-              });
             } catch (err: any) {
               reactError();
+              cmdLogStatus = 'error';
+              cmdErrorMessage = err?.message || 'Processing error';
               console.error(`Error executing command .${command}:`, err);
               await sock.sendMessage(
                 remoteJid,
@@ -5146,6 +5748,27 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
                 },
                 { quoted: msg }
               ).catch(() => {});
+            }
+            } finally {
+              if (reactWorkingTimer) {
+                clearTimeout(reactWorkingTimer);
+                reactWorkingTimer = null;
+              }
+              const elapsedMs = Math.max(1, Math.round((performance.now() - cmdExecPerfStart) * 10) / 10);
+              const finishedLog = this.finishCommandLog(activeCmdLog.id, {
+                status: cmdLogStatus,
+                responseTimeMs: elapsedMs,
+                replyPreview: cmdReplyPreview,
+                errorMessage: cmdErrorMessage,
+              });
+              const currentStats = this.getCommandStats();
+              this.addNotification({
+                type: 'command',
+                title: `⚡ Command Executed: .${command} (${elapsedMs}ms)`,
+                body: `Chat: ${resolvedChatName} • Speed: ${finishedLog?.speedRating || 'FAST'} • Rate: ${currentStats.commandsPerMinute} cmd/min`,
+                sender: resolvedSenderPhone,
+                data: finishedLog,
+              });
             }
           }
         })().catch((workerErr) => {
