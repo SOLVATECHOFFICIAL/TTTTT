@@ -3,6 +3,10 @@ import path from 'path';
 import { isFirestoreQuotaExhausted, reportFirestoreError } from '../services/firestore-status.ts';
 import { db, collection, doc, setDoc, getDoc, getDocs, onSnapshot, runTransaction, writeBatch } from './firebase-admin.ts';
 
+export const getPublicPortalUrl = (): string => {
+  return process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || 'https://solvatech-bot.onrender.com';
+};
+
 export interface CommandContext {
   command: string;
   args: string[];
@@ -720,7 +724,7 @@ class CommandHandler {
 ⚙️ *Command Processing:* *${processingLatency}ms*
 🟢 *Status:* *ACTIVE & OPERATIONAL*
 🛡️ *Engine:* *SOLVATECH Multi-Device Engine*
-🌐 *Portal:* solvatech.up.railway.app
+🌐 *Portal:* ${getPublicPortalUrl()}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 > ⚡ *SOLVATECH FAST ENGINE*`,
       };
@@ -1698,7 +1702,7 @@ Message successfully pinned for 7 days by Group Admin!
 
 ⚡ *STATUS:*  🟢 *ARMED & OPERATIONAL*
 👑 *ACCESS:*  👑 *BOT OWNER EXCLUSIVE*
-🌐 *DOMAIN:* solvatech.up.railway.app
+🌐 *DOMAIN:* ${getPublicPortalUrl().replace(/^https?:\/\//, '')}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🛡️ *ACTIVE SHIELD POLICIES*
@@ -1736,7 +1740,7 @@ Message successfully pinned for 7 days by Group Admin!
 🗑️ *OFFENDING MEDIA:* *Auto-deleted on warning (pics/stickers/text)*
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-> 🛡️ *SOLVATECH AUTOMATED ENGINE* • _solvatech.up.railway.app_`,
+> 🛡️ *SOLVATECH AUTOMATED ENGINE* • _${getPublicPortalUrl().replace(/^https?:\/\//, '')}_`,
       };
     }
 
@@ -1774,7 +1778,7 @@ Message successfully pinned for 7 days by Group Admin!
 💳 *OPay Account:* *9049979183* (Solomon Oladimeji)
 💬 *Official WhatsApp:* *+234 904 997 9183*
 🔒 *Bot Access Mode:* *100% Private (Owner-Only Execution)*
-🌐 *Web Portal:* solvatech.up.railway.app
+🌐 *Web Portal:* ${getPublicPortalUrl()}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🌐 *WEB SERVICES:*
 Developer Solomon builds websites of any kind! DM *wa.me/2349049979183* for custom web applications, SaaS dashboards, e-commerce, and bots.

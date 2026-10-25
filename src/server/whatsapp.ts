@@ -2021,13 +2021,11 @@ export class WhatsAppManager {
         // Priority 1: Check Firebase Firestore collection 'column' (User email, phone, and 3 keys)
         try {
           let colSnap: any = null;
-          // Step 1: Check document keyed by user email
-          if (cleanEmail) {
+          // Step 1: Check document keyed by canonical sessionDocId (fastest 1-read restore)
+          colSnap = await getDoc(doc(db, 'column', sessionDocId));
+          // Step 2: Fallback to user email if migrating legacy data
+          if ((!colSnap || !colSnap.exists) && cleanEmail) {
             colSnap = await getDoc(doc(db, 'column', cleanEmail));
-          }
-          // Step 2: Check document keyed by sessionDocId
-          if (!colSnap || !colSnap.exists) {
-            colSnap = await getDoc(doc(db, 'column', sessionDocId));
           }
           // Step 3: Default fallback
           if ((!colSnap || !colSnap.exists) && this.sanitizedUserId === 'default') {
@@ -2852,7 +2850,8 @@ export class WhatsAppManager {
               const ownerDm = `${phone}@s.whatsapp.net`;
               setTimeout(async () => {
                 try {
-                  const welcomeCaption = `⚡ *SOLVATECH BOT CONNECTED SUCCESSFULLY* ⚡\n\n🎉 Welcome! Your WhatsApp account (+${phone}) is now officially linked with the SOLVATECH automation engine.\n\n🛡️ *Active Features:*\n• Anti-Delete Message Recovery (deleted messages flood here)\n• View-Once Media Decryption (*.open* / *.vv*)\n• Group Security, Anti-Link & Anti-Bot matrix\n• High-Speed Media & Sticker Converters\n• Over 35+ Automation Commands\n\n💬 *Commands Directory:* Type *.menu* to view all commands.\n🌐 *Web Console:* ${process.env.APP_URL || 'SOLVATECH Web Portal'}\n\n> 👑 _Developer: Solomon Oladimeji (+234 904 997 9183)_`;
+                  const publicConsoleUrl = process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || 'https://solvatech-bot.onrender.com';
+                  const welcomeCaption = `⚡ *SOLVATECH BOT CONNECTED SUCCESSFULLY* ⚡\n\n🎉 Welcome! Your WhatsApp account (+${phone}) is now officially linked with the SOLVATECH automation engine.\n\n🛡️ *Active Features:*\n• Anti-Delete Message Recovery (deleted messages flood here)\n• View-Once Media Decryption (*.open* / *.vv*)\n• Group Security, Anti-Link & Anti-Bot matrix\n• High-Speed Media & Sticker Converters\n• Over 35+ Automation Commands\n\n💬 *Commands Directory:* Type *.menu* to view all commands.\n🌐 *Web Console:* ${publicConsoleUrl}\n\n> 👑 _Developer: Solomon Oladimeji (+234 904 997 9183)_`;
                   const brandBuf = await getSolvaBrandBuffer();
                   if (brandBuf) {
                     await sock.sendMessage(ownerDm, {

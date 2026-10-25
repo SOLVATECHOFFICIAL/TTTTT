@@ -89,14 +89,17 @@ const expiryMillis = (value: any): number => {
 async function startServer() {
   const app = express();
   const server = http.createServer(app);
-  const isRailway = Boolean(
+  const isCloudHost = Boolean(
+    process.env.RENDER ||
+    process.env.RENDER_EXTERNAL_URL ||
     process.env.RAILWAY_SERVICE_ID ||
     process.env.RAILWAY_ENVIRONMENT_ID ||
     process.env.RAILWAY_PUBLIC_DOMAIN ||
-    process.env.RAILWAY_STATIC_URL,
+    process.env.RAILWAY_STATIC_URL ||
+    process.env.NODE_ENV === 'production'
   );
   const rawPort = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
-  const PORT = isRailway ? rawPort : 3000;
+  const PORT = (isCloudHost && process.env.PORT) ? rawPort : 3000;
   const isProd = process.env.NODE_ENV === 'production';
 
   app.use(express.json());
@@ -110,6 +113,31 @@ async function startServer() {
     }
     next();
   });
+
+  // 🟢 24/7 Uptime Keep-Alive & Ping Endpoints for Render / UptimeRobot
+  // Ultra-lightweight (<1ms response, 0 DB queries, 0 Firestore quota) to keep Render awake 24/7 for life
+  const uptimePingHandler = (_req: express.Request, res: express.Response) => {
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    const publicUrl = process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || 'https://solvatech-bot.onrender.com';
+    return res.status(200).json({
+      status: 'ok',
+      service: 'SOLVATECH BOT 24/7',
+      uptimeSeconds: Math.floor(process.uptime()),
+      timestamp: new Date().toISOString(),
+      platform: process.env.RENDER ? 'render' : 'cloud',
+      url: publicUrl,
+    });
+  };
+
+  app.get('/ping', uptimePingHandler);
+  app.head('/ping', uptimePingHandler);
+  app.get('/health', uptimePingHandler);
+  app.head('/health', uptimePingHandler);
+  app.get('/uptime', uptimePingHandler);
+  app.head('/uptime', uptimePingHandler);
+  app.get('/api/health', uptimePingHandler);
+  app.head('/api/health', uptimePingHandler);
 
   const requireOwnerAuth = async (req: express.Request, res: express.Response): Promise<boolean> => {
     res.setHeader('Cache-Control', 'private, no-store');
@@ -2057,7 +2085,7 @@ async function startServer() {
     }, 2000);
   });
 
-  if (isRailway && PORT !== 8080) {
+  if ((process.env.RAILWAY_SERVICE_ID || process.env.RAILWAY_ENVIRONMENT_ID) && PORT !== 8080) {
     try {
       const secondaryServer = http.createServer(app);
       secondaryServer.on('error', (err: any) => {
