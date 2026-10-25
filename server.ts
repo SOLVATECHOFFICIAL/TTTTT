@@ -5,7 +5,7 @@ import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { db, doc, getDoc, setDoc, runTransaction, collection, getDocs, deleteDoc, listAllFirebaseUsers } from './src/server/firebase-admin.ts';
+import { db, doc, getDoc, setDoc, runTransaction, collection, getDocs, deleteDoc, listAllFirebaseUsers, verifyFirebaseIdToken } from './src/server/firebase-admin.ts';
 import { sessionManager, whatsappManager } from './src/server/whatsapp.ts';
 import { commandHandler, SOLVATECH_MENU } from './src/server/commands.ts';
 import {
@@ -145,12 +145,8 @@ async function startServer() {
     res.setHeader('Vary', 'Authorization');
     const match = /^Bearer\s+([^\s]+)$/i.exec(req.header('authorization') || '');
     const idToken = match?.[1];
-    const fallbackHeaderEmail = (req.header('x-user-email') || (req.query.userEmail as string) || '')?.trim().toLowerCase();
 
     if (!idToken || idToken.length > 8192) {
-      if (fallbackHeaderEmail && isOwnerEmail(fallbackHeaderEmail)) {
-        return true;
-      }
       res.status(401).json({ success: false, error: 'Sign in as the owner to access this endpoint.' });
       return false;
     }
@@ -158,8 +154,14 @@ async function startServer() {
     try {
       let userEmail: string | undefined;
 
-      // 1. If Firebase API key is configured, check identitytoolkit
-      if (firebaseConfig.apiKey) {
+      // 1. Verify via Firebase Admin SDK if configured
+      const adminVerified = await verifyFirebaseIdToken(idToken);
+      if (adminVerified?.email) {
+        userEmail = adminVerified.email;
+      }
+
+      // 2. Cryptographically verify ID token via Google Identity Toolkit lookup
+      if (!userEmail && firebaseConfig.apiKey) {
         try {
           const response = await fetch(
             `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
@@ -181,32 +183,12 @@ async function startServer() {
         }
       }
 
-      // 2. Resilient JWT decode fallback for offline or custom auth tokens
-      if (!userEmail) {
-        try {
-          const parts = idToken.split('.');
-          if (parts.length === 3) {
-            const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
-            if (payload && typeof payload.email === 'string') {
-              userEmail = payload.email;
-            }
-          }
-        } catch {}
-      }
-
-      if (!userEmail && fallbackHeaderEmail && isOwnerEmail(fallbackHeaderEmail)) {
-        userEmail = fallbackHeaderEmail;
-      }
-
       if (!userEmail || !isOwnerEmail(userEmail)) {
         res.status(403).json({ success: false, error: 'Owner access is required.' });
         return false;
       }
       return true;
     } catch (err) {
-      if (fallbackHeaderEmail && isOwnerEmail(fallbackHeaderEmail)) {
-        return true;
-      }
       console.error('Owner identity verification unavailable:', err);
       res.status(503).json({ success: false, error: 'Could not verify owner access. Please retry.' });
       return false;
@@ -301,13 +283,11 @@ async function startServer() {
     res.status(404).send('Not found');
   });
 
-  // Sync user license with 24/7 heartbeat watchdog
+  // Sync user license with 24/7 heartbeat watchdog (authoritative from server/Firestore)
   app.post('/api/whatsapp/sync-license', async (req, res) => {
     try {
       const userId = (req.body?.userId as string) || (req.query.userId as string) || (req.headers['x-user-id'] as string) || '';
       const userEmail = (req.body?.userEmail as string) || (req.query?.userEmail as string) || (req.headers['x-user-email'] as string) || '';
-      const incomingExpiresAt = req.body?.expiresAt || req.query?.expiresAt || null;
-      const isUnlimited = Boolean(req.body?.isUnlimited || req.query?.isUnlimited || (userEmail && isOwnerEmail(userEmail)));
 
       if (!userId) {
         return res.status(400).json({ success: false, error: 'User ID is required.' });
@@ -317,46 +297,13 @@ async function startServer() {
         session.userEmail = userEmail;
       }
 
-      if (isUnlimited) {
-        session.setSessionLicense(null, true);
-        if (!isFirestoreQuotaExhausted()) {
-          try {
-            await setDoc(doc(db, 'users', userId), {
-              uid: userId,
-              ...(userEmail ? { email: userEmail } : {}),
-              isUnlimited: true,
-              licenseStatus: 'unlimited',
-              licensePlan: '👑 Unlimited Lifetime (Admin Granted)',
-              licenseExpiresAt: null,
-              updatedAt: new Date().toISOString(),
-            }, { merge: true });
-          } catch (err) {
-            reportFirestoreError(err);
-          }
-        }
-      } else if (incomingExpiresAt && new Date(incomingExpiresAt).getTime() > Date.now()) {
-        session.setSessionLicense(incomingExpiresAt, false);
-        if (!isFirestoreQuotaExhausted()) {
-          try {
-            await setDoc(doc(db, 'users', userId), {
-              uid: userId,
-              ...(userEmail ? { email: userEmail } : {}),
-              isUnlimited: false,
-              licenseStatus: 'active',
-              licenseExpiresAt: incomingExpiresAt,
-              updatedAt: new Date().toISOString(),
-            }, { merge: true });
-          } catch (err) {
-            reportFirestoreError(err);
-          }
-        }
-      }
-
+      // Only grant owner unlimited if the user document in Firestore is verified owner or already marked unlimited by admin
       await session.syncLicenseFromFirestore();
+      const status = session.getStatus();
       res.json({
         success: true,
         isExpired: session.isLicenseExpired(),
-        expiresAt: session.getStatus().licenseExpiresAt || null,
+        expiresAt: status.licenseExpiresAt || null,
         serverTime: new Date().toISOString(),
         message: 'License synchronized from Firebase.',
       });
@@ -658,11 +605,73 @@ async function startServer() {
   });
 
   // -------------------------------------------------------------
+  // ADMIN IN-APP BROADCAST ANNOUNCEMENTS
+  // -------------------------------------------------------------
+  let latestSystemBroadcast: { id: string; title: string; body: string; timestamp: string; createdAtMs: number } | null = null;
+
+  app.post('/api/admin/broadcast', async (req, res) => {
+    if (!(await requireOwnerAuth(req, res))) return;
+    try {
+      const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+      const title = typeof req.body?.title === 'string' && req.body.title.trim() ? req.body.title.trim() : '📢 System Announcement';
+      if (!message) {
+        return res.status(400).json({ success: false, error: 'Broadcast message text is required.' });
+      }
+
+      const broadcastPayload = {
+        id: 'bcast_' + Date.now(),
+        title,
+        body: message,
+        timestamp: new Date().toLocaleTimeString(),
+        createdAtMs: Date.now(),
+      };
+      latestSystemBroadcast = broadcastPayload;
+
+      // Deliver into the in-app notification panel of all active user sessions
+      const deliveredSessions = sessionManager.broadcastInAppNotification(title, message);
+
+      if (!isFirestoreQuotaExhausted()) {
+        try {
+          await setDoc(doc(db, 'system_settings', 'latest_broadcast'), broadcastPayload, { merge: true });
+        } catch (err) {
+          reportFirestoreError(err);
+        }
+      }
+
+      res.json({
+        success: true,
+        deliveredSessions,
+        broadcast: broadcastPayload,
+        message: `Broadcast delivered to in-app notification panels (${deliveredSessions} active session${deliveredSessions === 1 ? '' : 's'}).`,
+      });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message || 'Failed to send broadcast' });
+    }
+  });
+
+  app.get('/api/broadcast/latest', async (_req, res) => {
+    try {
+      if (!latestSystemBroadcast && !isFirestoreQuotaExhausted()) {
+        try {
+          const snap = await getDoc(doc(db, 'system_settings', 'latest_broadcast'));
+          if (snap.exists) {
+            latestSystemBroadcast = snap.data() as any;
+          }
+        } catch {}
+      }
+      res.json({ success: true, broadcast: latestSystemBroadcast });
+    } catch {
+      res.json({ success: true, broadcast: null });
+    }
+  });
+
+  // -------------------------------------------------------------
   // LICENSE MANAGEMENT & REDEMPTION (BIDIRECTIONAL PERSISTENT STORE)
   // -------------------------------------------------------------
 
-  // Save single minted key to persistent store & server db
+  // Save single minted key to persistent store & server db (Owner Only)
   app.post('/api/licenses/create', async (req, res) => {
+    if (!(await requireOwnerAuth(req, res))) return;
     try {
       const record = req.body;
       if (!record || !record.key) {
@@ -679,8 +688,9 @@ async function startServer() {
     }
   });
 
-  // Batch save minted keys to persistent store & server db
+  // Batch save minted keys to persistent store & server db (Owner Only)
   app.post('/api/licenses/batch-create', async (req, res) => {
+    if (!(await requireOwnerAuth(req, res))) return;
     try {
       const licenses = req.body?.licenses || [];
       if (!Array.isArray(licenses)) {
@@ -698,8 +708,9 @@ async function startServer() {
     }
   });
 
-  // List all licenses (merging server persistent store and Firestore)
+  // List all licenses (merging server persistent store and Firestore — Owner Only)
   app.get('/api/licenses', async (req, res) => {
+    if (!(await requireOwnerAuth(req, res))) return;
     try {
       const map = new Map<string, any>();
       // 1. From persistent store
@@ -725,8 +736,9 @@ async function startServer() {
     }
   });
 
-  // Delete a license
+  // Delete a license (Owner Only)
   app.delete('/api/licenses/:key', async (req, res) => {
+    if (!(await requireOwnerAuth(req, res))) return;
     const key = (req.params.key || '').trim().toUpperCase();
     deleteLicenseRecord(key);
     try {
@@ -735,8 +747,9 @@ async function startServer() {
     res.json({ success: true, message: `License ${key} deleted` });
   });
 
-  // Wipe unused licenses
+  // Wipe unused licenses (Owner Only)
   app.post('/api/licenses/wipe-unused', async (req, res) => {
+    if (!(await requireOwnerAuth(req, res))) return;
     const count = wipeUnusedLicenseRecords();
     if (!isFirestoreQuotaExhausted()) {
       try {
@@ -765,8 +778,9 @@ async function startServer() {
     res.json({ success: true, count, message: `Wiped ${count} unused licenses` });
   });
 
-  // Wipe expired licenses
+  // Wipe expired licenses (Owner Only)
   app.post('/api/licenses/wipe-expired', async (req, res) => {
+    if (!(await requireOwnerAuth(req, res))) return;
     const count = wipeExpiredLicenseRecords();
     res.json({ success: true, count, message: `Wiped ${count} expired licenses` });
   });
@@ -832,22 +846,6 @@ async function startServer() {
           }
         } catch (restErr) {
           console.debug('Firestore REST lookup note:', restErr);
-        }
-      }
-
-      // 3. Fallback: If client provided license snapshot (from Firestore or mint cache)
-      if (!license && req.body?.clientLicenseRecord) {
-        const clr = req.body.clientLicenseRecord;
-        if (clr && typeof clr.key === 'string' && clr.key.trim().toUpperCase() === key) {
-          license = saveLicenseRecord({
-            key,
-            planId: clr.planId || 'custom',
-            planName: clr.planName || 'Paid License Plan',
-            durationDays: Number(clr.durationDays) || 1,
-            durationMinutes: Number(clr.durationMinutes) || 0,
-            status: clr.status || 'unclaimed',
-            createdAt: clr.createdAt || new Date().toISOString(),
-          });
         }
       }
 
@@ -1843,8 +1841,9 @@ async function startServer() {
         });
       }
 
-      // Try reconnecting for up to 60 seconds
+      // Reset 1-minute reconnect timeout and try reconnecting for up to 60 seconds
       console.log(`[Manual Reconnect] Starting 60s reconnect pass for ${userId} (${currentStatus.user?.phone || 'device'})...`);
+      session.resetReconnectTimeout();
       await session.initSocket().catch((err) => {
         console.warn(`[Manual Reconnect] Socket init note:`, err?.message || err);
       });
@@ -1941,6 +1940,7 @@ async function startServer() {
         });
       }
 
+      session.resetReconnectTimeout();
       await session.initSocket();
 
       // Try reconnecting for up to 60 seconds (1 full minute)
@@ -1984,29 +1984,13 @@ async function startServer() {
       return res.status(504).json({
         success: false,
         reason: 'unreachable',
-        error: `Could not reach WhatsApp on phone within 1 minute. Can't reach WhatsApp or phone is offline. Tap pair instead.`,
+        error: `Could not reach WhatsApp on phone within 1 minute. Can't reach WhatsApp or phone is offline. Tap Reconnect when online.`,
         status: latestStatus,
       });
     } catch (err: any) {
       console.error('[Admin Reconnect User] Error:', err);
       res.status(500).json({ success: false, error: err?.message || 'Reconnection failed' });
     }
-  });
-
-  // 🛡️ 24/7 INSTANT HEALTH CHECKS: Compatible with Railway, UptimeRobot, and cloud load balancers
-  app.get(['/health', '/api/health'], (_req, res) => {
-    res.json({
-      status: 'ok',
-      uptime: Math.round(process.uptime()),
-      bot: 'SOLVATECH',
-      memoryRssMb: Math.round(process.memoryUsage().rss / 1048576),
-      firebase: firebaseConfig.projectId,
-      timestamp: new Date().toISOString()
-    });
-  });
-
-  app.get('/ping', (_req, res) => {
-    res.status(200).send('pong');
   });
 
   // 🛡️ SELF-HEALING KEEP-ALIVE HEARTBEAT (Pings internal health route every 4 minutes)

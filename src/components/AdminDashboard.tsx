@@ -505,7 +505,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const getAdminAuthHeaders = async (): Promise<Record<string, string>> => {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
-      'x-fallback-user-email': currentUserEmail || OWNER_EMAIL,
+      'x-user-email': currentUserEmail || OWNER_EMAIL,
     };
     try {
       const token = await auth?.currentUser?.getIdToken();
@@ -831,9 +831,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   // RESTART WHATSAPP SESSION
   const handleRestartSocket = async () => {
-    if (!confirm('Are you sure you want to reset the WhatsApp session? Users will need to re-pair.')) return;
+    if (!confirm('Are you sure you want to reset your WhatsApp session? You will need to re-pair.')) return;
     try {
-      const res = await fetch('/api/whatsapp/logout', { method: 'POST' });
+      const res = await fetch('/api/whatsapp/logout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId || 'default' }),
+      });
       if (res.ok) {
         showToast('WhatsApp session reset successfully.');
         loadLiveStatus();
@@ -843,18 +847,34 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     }
   };
 
-  // SEND BROADCAST
+  // SEND BROADCAST (Delivers to in-app notification panel across active user sessions)
   const handleSendBroadcast = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!broadcastText.trim()) return;
     setBroadcastSending(true);
     try {
-      setBroadcastSuccess('Announcement broadcast sent to all active client sessions!');
-      setBroadcastText('');
-      setTimeout(() => setBroadcastSuccess(null), 4000);
-      showToast('Announcement broadcast sent!');
+      const headers = await getAdminAuthHeaders();
+      const res = await fetch('/api/admin/broadcast', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          title: '📢 Admin Announcement',
+          message: broadcastText.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (res.ok && data?.success) {
+        setBroadcastSuccess(data.message || 'Announcement broadcast sent to all active client notification panels!');
+        setBroadcastText('');
+        setTimeout(() => setBroadcastSuccess(null), 4000);
+        showToast(data.message || 'Announcement broadcast sent!');
+        void loadLiveStatus();
+      } else {
+        showToast(data?.error || 'Failed to send broadcast announcement.');
+      }
     } catch (err) {
       console.error(err);
+      showToast('Network error while sending broadcast.');
     } finally {
       setBroadcastSending(false);
     }

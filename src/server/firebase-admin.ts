@@ -652,3 +652,20 @@ export async function listAllFirebaseUsers(): Promise<Array<{ uid: string; email
     return [];
   }
 }
+
+export async function verifyFirebaseIdToken(idToken: string): Promise<{ uid: string; email?: string } | null> {
+  if (!idToken || isMock) return null;
+  try {
+    const adminApps = getAdminApps();
+    if (!adminApps.length) return null;
+    const authAdmin = getAuth(adminApps[0]);
+    const decoded = await authAdmin.verifyIdToken(idToken);
+    return {
+      uid: decoded.uid,
+      email: decoded.email,
+    };
+  } catch {
+    return null;
+  }
+}
+

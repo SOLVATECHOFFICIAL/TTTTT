@@ -81,6 +81,23 @@ export function generateKeyString(planPrefix: string): string {
   return `SOLVA-${planPrefix.toUpperCase()}-${p1}-${p2}`;
 }
 
+async function getOwnerAuthHeaders(): Promise<Record<string, string>> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  try {
+    const idToken = await auth?.currentUser?.getIdToken().catch(() => '');
+    const userEmail = auth?.currentUser?.email || OWNER_EMAIL;
+    if (idToken) {
+      headers['Authorization'] = `Bearer ${idToken}`;
+    }
+    if (userEmail) {
+      headers['x-user-email'] = userEmail;
+    }
+  } catch {}
+  return headers;
+}
+
 export async function createLicense(plan: LicensePlan, createdBy: string = OWNER_EMAIL): Promise<LicenseRecord> {
   const record: LicenseRecord = {
     key: generateKeyString(plan.id),
@@ -95,9 +112,10 @@ export async function createLicense(plan: LicensePlan, createdBy: string = OWNER
 
   // 1. Immediately persist on the server (authoritative backend store)
   try {
+    const headers = await getOwnerAuthHeaders();
     await fetch('/api/licenses/create', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(record),
     });
   } catch (srvErr) {
@@ -143,7 +161,7 @@ export async function redeemKey(
 
   let data: any;
   try {
-    let response = await fetch('/api/license/redeem', {
+    const response = await fetch('/api/license/redeem', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -154,30 +172,6 @@ export async function redeemKey(
       }),
     });
     data = await response.json();
-
-    // If server didn't find the key (e.g. minted on client or during restart), check client Firestore fallback
-    if ((!response.ok || !data.success) && (response.status === 404 || data?.message?.includes('not found') || data?.message?.includes('Invalid'))) {
-      try {
-        const licSnap = await getDoc(doc(db, 'licenses', cleanKey));
-        if (licSnap.exists()) {
-          const licData = licSnap.data() as LicenseRecord;
-          response = await fetch('/api/license/redeem', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              userId: userUid,
-              email: cleanEmail,
-              key: cleanKey,
-              currentClientExpiresAt,
-              clientLicenseRecord: licData,
-            }),
-          });
-          data = await response.json();
-        }
-      } catch (fallbackErr) {
-        console.warn('Client Firestore fallback check note:', fallbackErr);
-      }
-    }
 
     if (!response.ok || !data.success) {
       return {
@@ -619,9 +613,10 @@ export async function batchCreateLicenses(
     created.push(lic);
   }
   try {
+    const headers = await getOwnerAuthHeaders();
     await fetch('/api/licenses/batch-create', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({ licenses: created }),
     });
   } catch {}
@@ -634,7 +629,8 @@ export async function fetchAllLicenses(): Promise<LicenseRecord[]> {
 
   // 1. Fetch from server backend store
   try {
-    const res = await fetch('/api/licenses');
+    const headers = await getOwnerAuthHeaders();
+    const res = await fetch('/api/licenses', { headers });
     if (res.ok) {
       const data = await res.json();
       if (Array.isArray(data.licenses)) {
@@ -682,7 +678,8 @@ export async function wipeAllUnusedLicenses(): Promise<{ count: number; message:
   let wipedCount = 0;
 
   try {
-    const res = await fetch('/api/licenses/wipe-unused', { method: 'POST' });
+    const headers = await getOwnerAuthHeaders();
+    const res = await fetch('/api/licenses/wipe-unused', { method: 'POST', headers });
     if (res.ok) {
       const d = await res.json();
       wipedCount = d.count || 0;
@@ -702,7 +699,8 @@ export async function wipeAllExpiredLicenses(): Promise<{ count: number; message
   let wipedCount = 0;
 
   try {
-    const res = await fetch('/api/licenses/wipe-expired', { method: 'POST' });
+    const headers = await getOwnerAuthHeaders();
+    const res = await fetch('/api/licenses/wipe-expired', { method: 'POST', headers });
     if (res.ok) {
       const d = await res.json();
       wipedCount = d.count || 0;
@@ -720,7 +718,8 @@ export async function wipeAllExpiredLicenses(): Promise<{ count: number; message
 // DELETE A SINGLE SPECIFIC LICENSE KEY
 export async function deleteSingleLicense(key: string): Promise<{ success: boolean; message: string }> {
   try {
-    await fetch(`/api/licenses/${encodeURIComponent(key)}`, { method: 'DELETE' });
+    const headers = await getOwnerAuthHeaders();
+    await fetch(`/api/licenses/${encodeURIComponent(key)}`, { method: 'DELETE', headers });
   } catch {}
 
   try {

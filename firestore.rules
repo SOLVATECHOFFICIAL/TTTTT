@@ -2,8 +2,78 @@ rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner() {
+      return isSignedIn() &&
+        request.auth.token.email != null &&
+        request.auth.token.email.lower() == 'awoyinfasolomon1@gmail.com';
+    }
+
+    function isSelf(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Users collection: Owner has full access; signed-in users can read their own profile
+    // and update non-privileged profile fields without escalating license status or expiry.
+    match /users/{userId} {
+      allow read: if isOwner() || isSelf(userId);
+      allow create: if isOwner() || (
+        isSelf(userId) &&
+        request.resource.data.get('isUnlimited', false) == false
+      );
+      allow update: if isOwner() || (
+        isSelf(userId) &&
+        request.resource.data.get('isUnlimited', false) == resource.data.get('isUnlimited', false) &&
+        request.resource.data.get('licenseExpiresAt', null) == resource.data.get('licenseExpiresAt', null) &&
+        request.resource.data.get('licenseStatus', 'expired') == resource.data.get('licenseStatus', 'expired') &&
+        request.resource.data.get('licensePlan', '') == resource.data.get('licensePlan', '')
+      );
+      allow delete: if isOwner();
+    }
+
+    // User licenses ledger: readable by owner or self, writable only by owner/server
+    match /user_licenses/{userId} {
+      allow read: if isOwner() || isSelf(userId);
+      allow write: if isOwner();
+    }
+
+    // Minted licenses: only owner/server can list, create, update, or delete
+    match /licenses/{licenseKey} {
+      allow read, write: if isOwner();
+    }
+
+    // Claimed trials ledger: readable by signed-in users, writable only by owner/server
+    match /claimed_trials/{trialId} {
+      allow read: if isSignedIn();
+      allow write: if isOwner();
+    }
+
+    // System settings & announcements: readable by signed-in users, writable only by owner
+    match /system_settings/{docId} {
+      allow read: if isSignedIn();
+      allow write: if isOwner();
+    }
+
+    // WhatsApp companion session credentials: strictly restricted to server/owner
+    match /column/{docId} {
+      allow read, write: if isOwner();
+    }
+
+    match /whatsapp_sessions/{docId} {
+      allow read, write: if isOwner();
+    }
+
+    match /whatsapp_auth/{docId} {
+      allow read, write: if isOwner();
+    }
+
+    // Default deny for any other collection unless owner
     match /{document=**} {
-      allow read, write: if true;
+      allow read, write: if isOwner();
     }
   }
 }
+

@@ -1904,9 +1904,9 @@ export class WhatsAppManager {
       timestamp: new Date().toLocaleTimeString(),
     };
     this.notifications.unshift(newNotification);
-    // User request: once notifications hit 5, clear them instantly so it stays clean
-    if (this.notifications.length >= 5) {
-      this.notifications = [];
+    // Retain a rolling history of the 20 most recent notifications
+    if (this.notifications.length > 20) {
+      this.notifications = this.notifications.slice(0, 20);
     }
   }
 
@@ -2410,17 +2410,28 @@ export class WhatsAppManager {
       this.reconnectTimer = null;
     }
 
-    // Honest status: disconnect and invite user to generate fresh pairing code
+    // 1-minute window elapsed: pause automatic background retries and require manual Reconnect button
+    const hasSavedPairing = this.hasRegisteredCredentials();
     this.currentStatus.isConnected = false;
     this.currentStatus.state = 'disconnected';
     this.currentStatus.pairingStage = 'idle';
-    this.currentStatus.isPaired = false;
+    this.currentStatus.isPaired = Boolean(hasSavedPairing);
     this.currentStatus.pairingCode = undefined;
     this.currentStatus.qrCodeUrl = undefined;
     this.currentStatus.reconnectRemainingSeconds = undefined;
-    this.currentStatus.lastError = 'WhatsApp was unreachable after 1 minute with existing credentials. Please generate a fresh pairing code to connect.';
+    this.currentStatus.lastError = hasSavedPairing
+      ? 'Auto-reconnect paused after 1 minute because your phone was unreachable. Tap Reconnect when your phone is online.'
+      : 'WhatsApp was unreachable after 1 minute. Please generate a fresh pairing code to connect.';
 
-    console.log(`[Baileys Reconnect ${this.userId}] 1-minute timeout expired. WhatsApp unreachable with existing credentials. Disconnected and ready for fresh pairing.`);
+    this.addNotification({
+      type: 'system',
+      title: '⏸️ Auto-Reconnect Paused (1m Timeout)',
+      body: hasSavedPairing
+        ? 'Could not reach WhatsApp on your phone within 1 minute. Tap the Reconnect button to connect again.'
+        : 'WhatsApp was unreachable after 1 minute. Please pair your device when online.',
+    });
+
+    console.log(`[Baileys Reconnect ${this.userId}] 1-minute auto-reconnect timeout expired. Paused background retries (isPaired=${hasSavedPairing}); awaiting manual Reconnect button.`);
     void this.syncConnectionStatusToFirestore();
   }
 
@@ -2482,13 +2493,13 @@ export class WhatsAppManager {
     this.isIntentionalClosure = false;
     if (!isFreshPairing && this.hasRegisteredCredentials()) {
       if (this.reconnectTimedOut) {
-        console.log(`[Baileys Reconnect (${this.userId})] 1-minute verification window expired. WhatsApp unreachable with existing credentials. Awaiting user fresh pairing.`);
+        console.log(`[Baileys Reconnect (${this.userId})] 1-minute auto-reconnect window expired. Awaiting manual Reconnect button.`);
         this.currentStatus.isConnected = false;
         this.currentStatus.state = 'disconnected';
         this.currentStatus.pairingStage = 'idle';
-        this.currentStatus.isPaired = false;
-        this.currentStatus.lastError = 'WhatsApp was unreachable after 1 minute with existing credentials. Please generate a fresh pairing code to connect.';
-        throw new Error('WhatsApp unreachable after 1-minute verification window. Ready for fresh pairing.');
+        this.currentStatus.isPaired = true;
+        this.currentStatus.lastError = 'Auto-reconnect paused after 1 minute because your phone was unreachable. Tap Reconnect when your phone is online.';
+        throw new Error('WhatsApp auto-reconnect paused after 1-minute window. Tap Reconnect to retry.');
       }
       this.startReconnectWindow();
     }
@@ -2827,8 +2838,8 @@ export class WhatsAppManager {
                   } else if (this.reconnectTimedOut) {
                     this.currentStatus.state = 'disconnected';
                     this.currentStatus.pairingStage = 'idle';
-                    this.currentStatus.isPaired = false;
-                    this.currentStatus.lastError = 'WhatsApp was unreachable after 1 minute with existing credentials. Please generate a fresh pairing code to connect.';
+                    this.currentStatus.isPaired = true;
+                    this.currentStatus.lastError = 'Auto-reconnect paused after 1 minute because your phone was unreachable. Tap Reconnect when your phone is online.';
                   } else {
                     this.currentStatus.state = 'expired';
                   }
@@ -6970,6 +6981,7 @@ export class WhatsAppSessionManager {
         }
 
         // Start reconnection for disconnected licensed user with credentials
+        session.resetReconnectTimeout();
         session.initSocket().catch((err) => {
           console.warn(`[ReconnectAll] Socket init note for ${uid}:`, err?.message || err);
         });
@@ -7051,6 +7063,19 @@ export class WhatsAppSessionManager {
       },
       breakdown,
     };
+  }
+
+  public broadcastInAppNotification(title: string, body: string): number {
+    let deliveredCount = 0;
+    for (const session of this.sessions.values()) {
+      session.addNotification({
+        type: 'system',
+        title,
+        body,
+      });
+      deliveredCount++;
+    }
+    return deliveredCount;
   }
 }
 

@@ -308,14 +308,7 @@ export default function App() {
 
       const dataNotifs = await safeParseJson(resNotifs);
       if (dataNotifs && Array.isArray(dataNotifs.notifications)) {
-        if (dataNotifs.notifications.length >= 5) {
-          void fetch(`/api/whatsapp/notifications?userId=${encodeURIComponent(currentUser.uid)}`, {
-            method: 'DELETE',
-          }).catch(() => {});
-          setNotifications([]);
-        } else {
-          setNotifications(dataNotifs.notifications);
-        }
+        setNotifications(dataNotifs.notifications.slice(0, 20));
       }
 
       setToastNotification({
@@ -405,12 +398,18 @@ export default function App() {
             localStorage.getItem(`solvatech_license_expiresAt_${user.uid}`) ||
             (user.email ? localStorage.getItem(`solvatech_license_expiresAt_${user.email.toLowerCase()}`) : null);
           if (cachedExpiry && new Date(cachedExpiry).getTime() > Date.now()) {
-            setUserLicenseData((prev) => ({
-              ...prev,
-              expiresAt: cachedExpiry,
-              plan: 'Active Access',
-              isUnlimited: false,
-            }));
+            setUserLicenseData((prev) => {
+              if (prev.isUnlimited) return prev;
+              const prevMs = prev.expiresAt ? new Date(prev.expiresAt).getTime() : 0;
+              const cachedMs = new Date(cachedExpiry).getTime();
+              if (prevMs >= cachedMs && prev.plan && prev.plan !== 'Trial') return prev;
+              return {
+                ...prev,
+                expiresAt: cachedExpiry,
+                plan: prev.plan && prev.plan !== 'Trial' ? prev.plan : 'Active Access',
+                isUnlimited: false,
+              };
+            });
           }
         } catch {}
 
@@ -432,12 +431,20 @@ export default function App() {
                   localStorage.setItem(`solvatech_license_expiresAt_${user.uid}`, data.expiresAt);
                   if (user.email) localStorage.setItem(`solvatech_license_expiresAt_${user.email.toLowerCase()}`, data.expiresAt);
                 } catch {}
-                setUserLicenseData((prev) => ({
-                  ...prev,
-                  expiresAt: data.expiresAt,
-                  plan: '⚡ 30-Minute Test (Active)',
-                  isUnlimited: false,
-                }));
+                setUserLicenseData((prev) => {
+                  if (prev.isUnlimited) return prev;
+                  const prevMs = prev.expiresAt ? new Date(prev.expiresAt).getTime() : 0;
+                  const incomingMs = new Date(data.expiresAt).getTime();
+                  if (prevMs > incomingMs || (prev.key && prev.key !== 'FREE_TRIAL_30M')) {
+                    return prev;
+                  }
+                  return {
+                    ...prev,
+                    expiresAt: data.expiresAt,
+                    plan: prev.plan && prev.plan !== 'Trial' && prev.plan !== 'Active Access' ? prev.plan : '⚡ 30-Minute Test (Active)',
+                    isUnlimited: false,
+                  };
+                });
               }
             }
           })
@@ -694,30 +701,24 @@ export default function App() {
 
         const dataNotifs = await safeParseJson(resNotifs);
         if (dataNotifs && Array.isArray(dataNotifs.notifications)) {
-          if (dataNotifs.notifications.length >= 5) {
-            void fetch(`/api/whatsapp/notifications?userId=${encodeURIComponent(currentUser?.uid || '')}`, {
-              method: 'DELETE',
-            }).catch(() => {});
-            setNotifications([]);
-          } else {
-            setNotifications((prev) => {
-              if (
-                prev.length === dataNotifs.notifications.length &&
-                prev.every((notification, index) => notification.id === dataNotifs.notifications[index]?.id)
-              ) {
-                return prev;
+          const incomingList = dataNotifs.notifications.slice(0, 20);
+          setNotifications((prev) => {
+            if (
+              prev.length === incomingList.length &&
+              prev.every((notification, index) => notification.id === incomingList[index]?.id)
+            ) {
+              return prev;
+            }
+            if (incomingList.length > 0 && incomingList[0]?.id !== prev[0]?.id) {
+              const newest = incomingList[0];
+              if (newest && (prev.length > 0 || newest.title?.includes('Announcement') || newest.title?.includes('Broadcast'))) {
+                setToastNotification(newest);
+                sendDeviceNotification(newest.title, newest.body);
+                setTimeout(() => setToastNotification(null), 5000);
               }
-              if (prev.length > 0 && dataNotifs.notifications.length > prev.length) {
-                const newest = dataNotifs.notifications[0];
-                if (newest && newest.id !== prev[0]?.id) {
-                  setToastNotification(newest);
-                  sendDeviceNotification(newest.title, newest.body);
-                  setTimeout(() => setToastNotification(null), 5000);
-                }
-              }
-              return dataNotifs.notifications;
-            });
-          }
+            }
+            return incomingList;
+          });
         }
       } catch (err) {
         console.debug('Polling WhatsApp note (offline resilient):', err);
