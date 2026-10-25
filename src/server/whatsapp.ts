@@ -668,6 +668,7 @@ export class WhatsAppManager {
   private pendingGreetings = new Map<string, { timer: NodeJS.Timeout; participants: Set<string>; action: 'add' | 'remove'; groupId: string }>();
   private mediaCache = new Map<string, string>();
   private consecutive401Count = 0;
+  private consecutive440Count = 0;
   private transientReconnectAttempt = 0;
   private commandRateLimiter = new TokenBucketRateLimiter(5, 4);
   private lastRateLimitNoticeAt = 0;
@@ -2160,7 +2161,7 @@ export class WhatsAppManager {
   private scheduleFirebaseCredsSync(immediate = false) {
     if (isFirestoreQuotaExhausted()) return;
     if (this.firebaseSyncTimer) clearTimeout(this.firebaseSyncTimer);
-    const delay = immediate ? 500 : 8000;
+    const delay = immediate ? 1500 : 25000;
     this.firebaseSyncTimer = setTimeout(() => {
       this.firebaseSyncTimer = null;
       if (isFirestoreQuotaExhausted()) return;
@@ -2169,7 +2170,7 @@ export class WhatsAppManager {
         return;
       }
 
-      const syncPromise = this.syncCredsToFirebase();
+      const syncPromise = this.syncCredsToFirebase(immediate);
       this.firebaseSyncPromise = syncPromise;
       syncPromise.finally(() => {
         if (this.firebaseSyncPromise === syncPromise) {
@@ -2185,8 +2186,12 @@ export class WhatsAppManager {
     }, delay);
   }
 
-  private async syncCredsToFirebase() {
+  private async syncCredsToFirebase(immediate = false) {
     if (isFirestoreQuotaExhausted()) return;
+    const now = Date.now();
+    if (!immediate && now - this.lastFirebaseSyncTime < 15000) {
+      return;
+    }
     try {
       if (!fs.existsSync(this.authDir)) return;
       const credsPath = path.join(this.authDir, 'creds.json');
@@ -2257,6 +2262,7 @@ export class WhatsAppManager {
       await setDoc(doc(db, 'column', sessionDocId), columnPayload, { merge: true });
 
       this.lastPersistedBundleHash = currentBundleHash;
+      this.lastFirebaseSyncTime = Date.now();
       console.log(`[WhatsApp Auth (${this.userId})] Successfully backed up master credentials to Firebase 'column' (email: ${cleanEmail || 'none'}, phone: ${cleanPhone || 'none'}).`);
 
       // Also persist connected status to users collection
@@ -2487,24 +2493,22 @@ export class WhatsAppManager {
 
     this.initPromise = (async () => {
       try {
-        if (this.sock && isFreshPairing) {
-          try {
-            (this.sock as any)._isIntentionalClose = true;
-            this.sock.end(undefined);
-          } catch {}
-          this.sock = null;
-        } else if (this.sock) {
+        if (this.sock) {
           const wsObj = (this.sock as any)?.ws?.socket || (this.sock as any)?.ws?._ws || (this.sock as any)?.ws;
           const wsState = wsObj?.readyState;
-          if (wsState === 1 || (this.sock as any)?.ws?.isOpen === true) {
-            this.currentStatus.isConnected = true;
+          if (!isFreshPairing && (wsState === 1 || (this.sock as any)?.ws?.isOpen === true) && this.currentStatus.isConnected) {
             this.currentStatus.state = 'connected';
             this.currentStatus.isPaired = true;
             return this.sock;
           }
-          if (wsState >= 2 || wsState === 3) {
-            this.sock = null;
-          }
+          try {
+            (this.sock as any)._isIntentionalClose = true;
+            (this.sock as any).ev?.removeAllListeners?.('connection.update');
+            (this.sock as any).ev?.removeAllListeners?.('creds.update');
+            (this.sock as any).ev?.removeAllListeners?.('messages.upsert');
+            this.sock.end(undefined);
+          } catch {}
+          this.sock = null;
         }
 
         this.ensureAuthDir();
@@ -2587,7 +2591,10 @@ export class WhatsAppManager {
         sock.ev.on('creds.update', (creds) => {
           this.credentialsSavePromise = this.credentialsSavePromise
             .then(() => saveCreds())
-            .then(() => this.scheduleFirebaseCredsSync(Boolean(creds?.registered)))
+            .then(() => {
+              const isHandshake = this.currentStatus.pairingStage === 'pairing_handshake' || this.currentStatus.pairingStage === 'code_generated';
+              this.scheduleFirebaseCredsSync(isHandshake);
+            })
             .catch((err) => console.warn('[WhatsApp Auth] Local credential save failed:', err));
           // Registration confirms the companion is paired; only connection.update("open")
           // confirms that the bot socket is currently online.
@@ -2756,6 +2763,59 @@ export class WhatsAppManager {
                       });
                     }, reconnectDelay);
                   }
+                } else if (
+                  statusCode === DisconnectReason.connectionReplaced ||
+                  statusCode === 440 ||
+                  reason === '440' ||
+                  reason === 'connectionReplaced'
+                ) {
+                  this.consecutive440Count++;
+                  console.warn(`[Baileys Connection (${this.userId})] Connection replaced by WhatsApp (code: 440, attempt ${this.consecutive440Count}). Another device or active instance connected with this session.`);
+
+                  if (this.reconnectTimer) {
+                    clearTimeout(this.reconnectTimer);
+                    this.reconnectTimer = null;
+                  }
+                  if (this.reconnectTimeoutTimer) {
+                    clearTimeout(this.reconnectTimeoutTimer);
+                    this.reconnectTimeoutTimer = null;
+                  }
+
+                  // If this is the first 440, it may be an overlapping deployment container on Render.
+                  // Back off for 25s once to let the previous container exit.
+                  if (this.consecutive440Count === 1 && hasRegisteredCreds && !this.isLicenseExpired()) {
+                    console.log(`[Baileys Connection (${this.userId})] Backing off for 25s to allow competing container to release session...`);
+                    this.currentStatus.state = 'disconnected';
+                    this.currentStatus.pairingStage = 'connected';
+                    this.currentStatus.isPaired = true;
+                    this.currentStatus.lastError = 'Connection temporarily replaced (code 440). Waiting for competing instance to release session...';
+                    await this.syncConnectionStatusToFirestore();
+
+                    this.reconnectTimer = setTimeout(() => {
+                      this.reconnectTimer = null;
+                      if (!this.isLicenseExpired() && !this.currentStatus.isConnected && !this.sock) {
+                        console.log(`[Baileys Connection (${this.userId})] Running single reconnect pass after 440 backoff...`);
+                        this.initSocket().catch((err) => {
+                          console.warn(`[Baileys Connection (${this.userId})] 440 backoff reconnect note:`, err?.message || err);
+                        });
+                      }
+                    }, 25000);
+                    return;
+                  }
+
+                  // Consecutive 440 (attempt >= 2): Another instance or WhatsApp Web is actively running!
+                  // Halt auto-reconnect completely to prevent memory surge and container crash loops!
+                  this.currentStatus.state = 'disconnected';
+                  this.currentStatus.pairingStage = 'idle';
+                  this.currentStatus.isPaired = hasRegisteredCreds;
+                  this.currentStatus.lastError = 'Connection replaced (code 440): Session active on another instance or device. Reconnection halted to avoid conflict.';
+                  await this.syncConnectionStatusToFirestore();
+                  this.addNotification({
+                    type: 'connection',
+                    title: 'WhatsApp Session Active Elsewhere',
+                    body: 'Another instance or device is active with this WhatsApp account (code 440). Reconnect loop paused. Tap Reconnect on web to take over.',
+                  });
+                  return;
                 } else if (hasRegisteredCreds) {
                   // Keep the saved pairing for already registered devices, auto-reconnect in background for up to 1 minute
                   if (!this.isLicenseExpired() && !this.reconnectTimedOut) {
@@ -2811,6 +2871,7 @@ export class WhatsAppManager {
               this.currentStatus.state = 'connected';
               this.currentStatus.isConnected = true;
               this.consecutive401Count = 0;
+              this.consecutive440Count = 0;
             this.currentStatus.connectedAt = this.connectedAt;
             this.currentStatus.pairingStage = 'connected';
             this.currentStatus.pairingCode = undefined;
@@ -6261,6 +6322,8 @@ export class WhatsAppSessionManager {
               session.initSocket().catch((err) => {
                 console.warn(`[Auto-Restore] Reconnect socket note for ${uid}:`, err?.message || err);
               });
+              // Stagger reconnects by 2.5s to prevent concurrent memory spikes on Render's 512MB RAM
+              await new Promise((r) => setTimeout(r, 2500));
             }
           } else if (!meta.linkedPhone) {
             console.log(`[Auto-Restore] User ${uid} (${meta.email || 'user'}) has valid license but has NOT linked WhatsApp before. Setting clean idle state ready for pairing.`);
@@ -6445,6 +6508,7 @@ export class WhatsAppSessionManager {
             session.initSocket().catch((err) => {
               console.warn(`[Global 1-Min Sync] Reconnect error for ${uid}:`, err?.message);
             });
+            await new Promise((r) => setTimeout(r, 2000));
           }
         } catch (uErr) {
           console.warn(`[Global 1-Min Sync] Error auditing user ${uid}:`, uErr);

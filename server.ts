@@ -60,21 +60,21 @@ process.on('unhandledRejection', (reason: any) => {
   }
 });
 
-// 🛡️ MEMORY GUARDIAN: Proactive RAM management for Railway 512MB limits
+// 🛡️ MEMORY GUARDIAN: Proactive RAM management for Render & Cloud 512MB limits
 // Periodically checks RSS memory and forces V8 garbage collection if available before hitting cgroup OOM
 setInterval(() => {
   try {
     const mem = process.memoryUsage();
     const rssMb = Math.round(mem.rss / 1048576);
     const heapMb = Math.round(mem.heapUsed / 1048576);
-    if (rssMb > 380) {
+    if (rssMb > 300) {
       console.warn(`[SOLVATECH Memory Guardian] Elevated memory detected: RSS=${rssMb}MB, Heap=${heapMb}MB. Running proactive GC...`);
       if (typeof global.gc === 'function') {
         global.gc();
       }
     }
   } catch {}
-}, 2 * 60 * 1000);
+}, 30 * 1000);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
