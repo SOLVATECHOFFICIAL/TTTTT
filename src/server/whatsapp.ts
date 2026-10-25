@@ -5596,14 +5596,15 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
     if (this.groupPictureCache.has(groupId)) {
       return this.groupPictureCache.get(groupId) || null;
     }
-    if (!this.sock || !this.currentStatus.isConnected) {
+    const currentSock = this.sock;
+    if (!currentSock || !this.currentStatus.isConnected || typeof currentSock.profilePictureUrl !== 'function') {
       return null;
     }
 
     try {
       // 1. Try high-definition profile picture
       const hdUrl = await Promise.race([
-        this.sock.profilePictureUrl(groupId, 'image'),
+        currentSock.profilePictureUrl(groupId, 'image'),
         new Promise<undefined>((_, reject) => setTimeout(() => reject(new Error('timeout')), 2500)),
       ]).catch(() => null);
 
@@ -5614,7 +5615,7 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
 
       // 2. Try preview thumbnail
       const previewUrl = await Promise.race([
-        this.sock.profilePictureUrl(groupId, 'preview'),
+        currentSock.profilePictureUrl(groupId, 'preview'),
         new Promise<undefined>((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000)),
       ]).catch(() => null);
 
@@ -5659,8 +5660,19 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
     if (!groupMeta || !this.sock) return false;
 
     const credsMe = (this.sock as any).authState?.creds?.me || (this.sock as any).user || {};
-    const botUserJid: string = credsMe.id || this.sock.user?.id || (this.sock as any).user?.jid || '';
-    const botUserLid: string = credsMe.lid || (this.sock as any).user?.lid || '';
+    let diskMeId = '';
+    let diskMeLid = '';
+    try {
+      const credsPath = path.join(this.authDir, 'creds.json');
+      if (fs.existsSync(credsPath)) {
+        const c = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
+        diskMeId = c?.me?.id || '';
+        diskMeLid = c?.me?.lid || '';
+      }
+    } catch {}
+
+    const botUserJid: string = credsMe.id || diskMeId || this.sock.user?.id || (this.sock as any).user?.jid || '';
+    const botUserLid: string = credsMe.lid || diskMeLid || (this.sock as any).user?.lid || '';
 
     const botPhone = (botUserJid.split(':')[0] || botUserJid.split('@')[0]).replace(/\D/g, '');
     const linkedPhoneClean = (this.currentStatus.user?.phone || this.currentStatus.targetPhone || '').replace(/\D/g, '');
@@ -5724,9 +5736,10 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
   }
 
   public async isBotAdminInGroupById(groupId: string): Promise<boolean> {
-    if (!groupId || !this.sock || !this.currentStatus.isConnected) return false;
+    const currentSock = this.sock;
+    if (!groupId || !currentSock || !this.currentStatus.isConnected) return false;
     try {
-      const meta = await this.getCachedGroupMetadata(this.sock, groupId);
+      const meta = await this.getCachedGroupMetadata(currentSock, groupId);
       if (!meta) return false;
       return this.isBotAdminInGroup(meta);
     } catch {
@@ -5735,9 +5748,10 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
   }
 
   public async isGroupParticipantAdmin(groupId: string, participantJid: string): Promise<boolean> {
-    if (!groupId || !participantJid || !this.sock || !this.currentStatus.isConnected) return false;
+    const currentSock = this.sock;
+    if (!groupId || !participantJid || !currentSock || !this.currentStatus.isConnected) return false;
     try {
-      const meta = await this.getCachedGroupMetadata(this.sock, groupId);
+      const meta = await this.getCachedGroupMetadata(currentSock, groupId);
       if (!meta) return false;
       const targetId = participantJid.split('@')[0].split(':')[0].replace(/\D/g, '');
       const targetIds = new Set<string>();
@@ -5773,11 +5787,12 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
     if (!groupId || !groupId.endsWith('@g.us')) {
       throw makeError(400, 'A valid WhatsApp group is required.');
     }
-    if (!this.sock || !this.currentStatus.isConnected) {
+    const currentSock = this.sock;
+    if (!currentSock || !this.currentStatus.isConnected) {
       throw makeError(409, 'Connect WhatsApp before exporting group contacts.');
     }
 
-    const metadata = await this.getCachedGroupMetadata(this.sock, groupId, true);
+    const metadata = await this.getCachedGroupMetadata(currentSock, groupId, true);
     if (!metadata || !Array.isArray(metadata.participants)) {
       throw makeError(404, 'WhatsApp did not return the group participant list.');
     }
@@ -5834,7 +5849,7 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
     };
   }
 
-  public async getGroupsWithSettings(adminOnlyFilter = true): Promise<Array<{
+  public async getGroupsWithSettings(adminOnlyFilter = false): Promise<Array<{
     id: string;
     subject: string;
     desc?: string;
@@ -5854,7 +5869,8 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
     };
   }>> {
     await commandHandler.loadAccountSecuritySettings(this.userId);
-    if (!this.sock) {
+    let activeSock = this.sock;
+    if (!activeSock || typeof activeSock.groupFetchAllParticipating !== 'function') {
       if (this.cachedGroups.length > 0 && this.hasRegisteredCredentials() && !this.isLicenseExpired()) {
         return this.cachedGroups;
       }
@@ -5874,12 +5890,46 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
     }> = [];
 
     try {
-      const allGroups = await this.sock.groupFetchAllParticipating();
+      let allGroups: Record<string, any> = {};
+      try {
+        allGroups = await Promise.race([
+          activeSock.groupFetchAllParticipating(),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 15000)),
+        ]);
+      } catch (firstErr: any) {
+        console.warn(`[Groups (${this.userId})] First fetch attempt note: ${firstErr?.message}. Retrying...`);
+        await new Promise((r) => setTimeout(r, 1000));
+        activeSock = this.sock;
+        if (!activeSock || typeof activeSock.groupFetchAllParticipating !== 'function') {
+          if (this.cachedGroups.length > 0) return this.cachedGroups;
+          return [];
+        }
+        allGroups = await Promise.race([
+          activeSock.groupFetchAllParticipating(),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 15000)),
+        ]);
+      }
+
+      if (!allGroups || typeof allGroups !== 'object') {
+        if (this.cachedGroups.length > 0) return this.cachedGroups;
+        return [];
+      }
 
       // Collect all possible identities of the linked account/user
-      const credsMe = (this.sock as any).authState?.creds?.me || (this.sock as any).user || {};
-      const botUserJid: string = credsMe.id || this.sock.user?.id || (this.sock as any).user?.jid || '';
-      const botUserLid: string = credsMe.lid || (this.sock as any).user?.lid || '';
+      const credsMe = (activeSock as any)?.authState?.creds?.me || (activeSock as any)?.user || {};
+      let diskMeId = '';
+      let diskMeLid = '';
+      try {
+        const credsPath = path.join(this.authDir, 'creds.json');
+        if (fs.existsSync(credsPath)) {
+          const c = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
+          diskMeId = c?.me?.id || '';
+          diskMeLid = c?.me?.lid || '';
+        }
+      } catch {}
+
+      const botUserJid: string = credsMe.id || diskMeId || activeSock?.user?.id || (activeSock as any)?.user?.jid || '';
+      const botUserLid: string = credsMe.lid || diskMeLid || (activeSock as any)?.user?.lid || '';
 
       const botPhone = (botUserJid.split(':')[0] || botUserJid.split('@')[0]).replace(/\D/g, '');
       const linkedPhoneClean = (this.currentStatus.user?.phone || this.currentStatus.targetPhone || '').replace(/\D/g, '');
@@ -5933,7 +5983,7 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
 
       for (const [gid, meta] of Object.entries(allGroups)) {
         const realSubject = meta.subject || this.groupSubjectCache.get(gid) || 'WhatsApp Group';
-          setBoundedCache(this.groupSubjectCache, gid, realSubject, 1000);
+        setBoundedCache(this.groupSubjectCache, gid, realSubject, 1000);
 
         // Check 1: Is user the group creator/owner? (In WhatsApp, the group creator is always admin)
         const isGroupOwner = isAccountMatch(meta.owner) || isAccountMatch((meta as any).ownerPn) || isAccountMatch((meta as any).creator);
@@ -5954,13 +6004,10 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
         const isParticipantAdmin = userParticipant?.admin === 'admin' || userParticipant?.admin === 'superadmin';
         const isAdmin = Boolean(isGroupOwner || isParticipantAdmin);
 
-        // STRICT USER REQUIREMENT:
-        // "ONLY FETCH GROUPS YOU ARE ADMINN REMOVE ALL SO A MEMBER WILL NOT CHNAGE A GROUO PROTECTIION"
-        // Always remove non-admin groups so members cannot change group protection!
-        if (adminOnlyFilter || !isAdmin) {
-          if (!isAdmin) {
-            continue;
-          }
+        // If adminOnlyFilter is explicitly requested, only return admin groups.
+        // Otherwise, return all groups the connected user is participating in!
+        if (adminOnlyFilter && !isAdmin) {
+          continue;
         }
 
         // Check if cached picture URL exists
@@ -5992,12 +6039,12 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
           })
         );
       }
-    } catch (err) {
-      console.warn('Error fetching live participating groups:', err);
+    } catch (err: any) {
+      console.warn(`[Groups (${this.userId})] Error fetching live participating groups:`, err?.message || err);
       if (this.cachedGroups.length > 0) {
         return this.cachedGroups;
       }
-      throw new Error('WhatsApp did not return a complete group list. Try syncing groups again.');
+      return [];
     }
 
     if (result.length > 0) {

@@ -1255,8 +1255,8 @@ async function startServer() {
           groups: [],
         });
       }
-      // STRICT USER REQUIREMENT: Only fetch groups where the account is an admin
-      const groups = await session.getGroupsWithSettings(true);
+      const adminOnly = req.body?.adminOnly === true || req.query.adminOnly === 'true';
+      const groups = await session.getGroupsWithSettings(adminOnly);
       res.json({ success: true, connected: true, groups });
     } catch (err: any) {
       console.error('Error syncing groups:', err);
