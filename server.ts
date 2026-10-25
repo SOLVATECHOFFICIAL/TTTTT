@@ -98,8 +98,9 @@ async function startServer() {
     process.env.RAILWAY_STATIC_URL ||
     process.env.NODE_ENV === 'production'
   );
-  const rawPort = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
-  const PORT = (isCloudHost && process.env.PORT) ? rawPort : 3000;
+  const requestedPort = Number.parseInt(process.env.PORT || '', 10);
+  const defaultPort = isCloudHost ? 3000 : 5000;
+  const PORT = Number.isInteger(requestedPort) && requestedPort > 0 ? requestedPort : defaultPort;
   const isProd = process.env.NODE_ENV === 'production';
 
   app.use(express.json());

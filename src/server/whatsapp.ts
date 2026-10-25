@@ -1384,7 +1384,9 @@ export class WhatsAppManager {
     if (!this.sock || !this.currentStatus.isConnected) return null;
     if (this.socketProbePromise) return this.socketProbePromise;
 
-    const probe = measureWebSocketRoundTrip((this.sock as any).ws);
+    const wsClient = (this.sock as any).ws;
+    const rawWs = wsClient?.socket || wsClient?._ws || wsClient;
+    const probe = measureWebSocketRoundTrip(rawWs);
     this.socketProbePromise = probe;
     try {
       return await probe;
@@ -1426,8 +1428,8 @@ export class WhatsAppManager {
       commandTokens: this.commandRateLimiter.getAvailableTokens(),
       commandTokenCapacity: this.commandRateLimiter.capacity,
       commandRefillPerSecond: 4,
-      // 24/7 Cloud hosting runs continuously on AC server power with 0% companion phone battery drain
-      batteryLevel: isConnected ? 100 : null,
+      // Cloud runtimes do not expose physical host battery telemetry.
+      batteryLevel: null,
     };
   }
 
