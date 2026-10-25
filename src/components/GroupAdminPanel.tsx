@@ -44,6 +44,7 @@ export interface GroupItem {
   pictureUrl?: string | null;
   memberCount: number;
   isAdmin: boolean;
+  adminStatusVerified?: boolean;
   creation?: number;
   owner?: string;
   settings: GroupSecuritySettings;
@@ -65,7 +66,8 @@ interface GroupAdminPanelProps {
 const GroupAvatar: React.FC<{
   group: GroupItem;
   userId?: string;
-}> = ({ group, userId }) => {
+  currentUser?: User | null;
+}> = ({ group, userId, currentUser }) => {
   const [imgError, setImgError] = useState(false);
   const [imgUrl, setImgUrl] = useState<string | null>(group.pictureUrl || null);
 
@@ -77,7 +79,14 @@ const GroupAvatar: React.FC<{
       // Attempt on-demand picture retrieval from server
       let isMounted = true;
       const q = userId ? `?userId=${encodeURIComponent(userId)}` : '';
-      fetch(`/api/groups/${encodeURIComponent(group.id)}/picture${q}`)
+      void (async () => {
+        const token = await currentUser?.getIdToken();
+        if (!token) return;
+        return fetch(`/api/groups/${encodeURIComponent(group.id)}/picture${q}`, {
+          headers: { Authorization: `Bearer ${token}` },
+          cache: 'no-store',
+        });
+      })()
         .then((res) => (res.ok ? res.json() : null))
         .then((data) => {
           if (isMounted && data?.pictureUrl) {
@@ -90,7 +99,7 @@ const GroupAvatar: React.FC<{
         isMounted = false;
       };
     }
-  }, [group.id, group.pictureUrl, userId]);
+  }, [group.id, group.pictureUrl, userId, currentUser]);
 
   const initials = group.subject
     ? group.subject
@@ -117,7 +126,7 @@ const GroupAvatar: React.FC<{
           <span className="text-[9px] uppercase tracking-tighter opacity-80 font-bold">Group</span>
         </div>
       )}
-      {group.isAdmin && (
+      {group.adminStatusVerified !== false && group.isAdmin && (
         <span
           className="absolute bottom-0 right-0 p-1 bg-amber-500 text-slate-950 rounded-tl-lg shadow-sm"
           title="Admin in this group"
@@ -156,6 +165,7 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
     // If not connected, do not attempt to fetch or show groups
     if (!isConnected) {
       setLoading(false);
+      setGroups((prev) => prev.map((group) => ({ ...group, adminStatusVerified: false })));
       return;
     }
     if (groupsRequestInFlight.current) return;
@@ -168,6 +178,10 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
     }
 
     try {
+      if (!currentUser || !userId) {
+        throw new Error('Sign in again to verify your WhatsApp group access.');
+      }
+      const token = await currentUser.getIdToken();
       const q = userId ? `&userId=${encodeURIComponent(userId)}` : '';
       const endpoint = isManualSync
         ? `/api/groups/sync?adminOnly=false${q}`
@@ -175,7 +189,10 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
       const method = isManualSync ? 'POST' : 'GET';
       const res = await fetch(endpoint, {
         method,
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
         ...(isManualSync && userId ? { body: JSON.stringify({ userId, adminOnly: false }) } : {}),
       }).catch(() => null);
 
@@ -189,24 +206,32 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
         if (data && Array.isArray(data.groups)) {
           if (data.connected === false) {
             setGroupSyncWarning(
-              'WhatsApp could not confirm the connection. The last confirmed groups are being kept.'
+              'WhatsApp is reconnecting. The last group list is shown as unverified; admin controls are disabled until roles are checked again.'
             );
+            setGroups((prev) => prev.map((group) => ({ ...group, adminStatusVerified: false })));
           } else if (!isManualSync && data.groups.length === 0 && groups.length > 0) {
             setGroupSyncWarning(
               'This background check returned no groups. Your last confirmed groups are still shown; use Sync & Detect Groups to verify them.'
             );
           } else {
-            setGroups(data.groups);
+            setGroups(data.groups.map((group) => ({
+              ...group,
+              adminStatusVerified: group.adminStatusVerified !== false,
+            })));
             setGroupSyncWarning(null);
           }
 
           if (isManualSync) {
-            const adminCount = data.groups.filter((group) => group.isAdmin).length;
+            const adminCount = data.groups.filter(
+              (group) => group.adminStatusVerified !== false && group.isAdmin
+            ).length;
             onShowToast?.({
               id: 'group_sync_' + Date.now(),
-              type: 'system',
-              title: 'Groups Synchronized 🔄',
-              body: `Found ${data.groups.length} participating WhatsApp groups (${adminCount} admin).`,
+              type: data.connected === false ? 'warning' : 'system',
+              title: data.connected === false ? 'WhatsApp is reconnecting' : 'Groups Synchronized 🔄',
+              body: data.connected === false
+                ? 'Group membership and admin roles were not verified. Retry after the socket reconnects.'
+                : `Found ${data.groups.length} participating WhatsApp groups (${adminCount} verified admin).`,
               timestamp: new Date().toLocaleTimeString(),
             });
           }
@@ -218,7 +243,9 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
       }
     } catch (err) {
       console.error('Failed to fetch groups:', err);
-      setGroupSyncWarning('The group list could not be loaded. Use Sync & Detect Groups to retry.');
+      setGroupSyncWarning(err instanceof Error
+        ? err.message
+        : 'The group list could not be loaded. Use Sync & Detect Groups to retry.');
     } finally {
       groupsRequestInFlight.current = false;
       setLoading(false);
@@ -232,7 +259,7 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
     } else {
       setLoading(false);
     }
-  }, [isConnected, userId]);
+  }, [isConnected, userId, currentUser]);
 
   // Handle single switch toggle
   const handleToggleSetting = async (

@@ -1223,9 +1223,17 @@ async function startServer() {
   // Groups Management & Security Settings (Auto-Welcome & Auto-Goodbye UI Switches per user session)
   app.get('/api/groups', async (req, res) => {
     try {
-      const session = getSessionForReq(req);
+      const identity = await verifyFirebaseUserForReq(req, res);
+      if (!identity) return;
+      const session = sessionManager.getSession(identity.uid, identity.email || '');
+      await session.ensureRestored();
       const status = session.getStatus();
-      const isLive = status.isConnected || session.isSocketActive();
+      const isLive = status.isConnected && session.isSocketActive();
+      if (!isLive && session.hasRegisteredCredentials() && !status.isExpired) {
+        void session.initSocket().catch((err) => {
+          console.warn(`[Groups ${identity.uid}] reconnect attempt failed:`, err?.message || err);
+        });
+      }
       if (!isLive && !session.hasRegisteredCredentials()) {
         return res.json({
           success: true,
@@ -1236,7 +1244,7 @@ async function startServer() {
       }
       const adminOnly = req.query.adminOnly === 'true' || req.query.adminOnly === '1';
       const groups = await session.getGroupsWithSettings(adminOnly);
-      res.json({ success: true, connected: true, groups });
+      return res.json({ success: true, connected: isLive, groups });
     } catch (err: any) {
       console.error('Error fetching groups:', err);
       res.status(500).json({ success: false, error: err.message, groups: [] });
@@ -1245,9 +1253,17 @@ async function startServer() {
 
   app.post('/api/groups/sync', async (req, res) => {
     try {
-      const session = getSessionForReq(req);
+      const identity = await verifyFirebaseUserForReq(req, res);
+      if (!identity) return;
+      const session = sessionManager.getSession(identity.uid, identity.email || '');
+      await session.ensureRestored();
       const status = session.getStatus();
-      const isLive = status.isConnected || session.isSocketActive();
+      const isLive = status.isConnected && session.isSocketActive();
+      if (!isLive && session.hasRegisteredCredentials() && !status.isExpired) {
+        void session.initSocket().catch((err) => {
+          console.warn(`[Groups ${identity.uid}] reconnect attempt failed:`, err?.message || err);
+        });
+      }
       if (!isLive && !session.hasRegisteredCredentials()) {
         return res.json({
           success: true,
@@ -1258,7 +1274,7 @@ async function startServer() {
       }
       const adminOnly = req.body?.adminOnly === true || req.query.adminOnly === 'true';
       const groups = await session.getGroupsWithSettings(adminOnly);
-      res.json({ success: true, connected: true, groups });
+      return res.json({ success: true, connected: isLive, groups });
     } catch (err: any) {
       console.error('Error syncing groups:', err);
       res.status(500).json({ success: false, error: err.message, groups: [] });
@@ -1267,7 +1283,9 @@ async function startServer() {
 
   app.get('/api/groups/:gid/picture', async (req, res) => {
     try {
-      const session = getSessionForReq(req);
+      const identity = await verifyFirebaseUserForReq(req, res);
+      if (!identity) return;
+      const session = sessionManager.getSession(identity.uid, identity.email || '');
       const { gid } = req.params;
       const pictureUrl = await session.getGroupPictureUrl(gid);
       if (pictureUrl) {
@@ -1304,7 +1322,9 @@ async function startServer() {
 
   app.post('/api/groups/settings', async (req, res) => {
     try {
-      const session = getSessionForReq(req);
+      const identity = await verifyFirebaseUserForReq(req, res);
+      if (!identity) return;
+      const session = sessionManager.getSession(identity.uid, identity.email || '');
       const { groupId, key, value } = req.body;
       const settingKeys = ['antilink', 'antibot', 'antistatus', 'antispam', 'autowelcome', 'autogoodbye'];
       if (!groupId || !settingKeys.includes(key) || typeof value !== 'boolean') {
@@ -1334,7 +1354,9 @@ async function startServer() {
 
   app.post('/api/groups/toggle-all', async (req, res) => {
     try {
-      const session = getSessionForReq(req);
+      const identity = await verifyFirebaseUserForReq(req, res);
+      if (!identity) return;
+      const session = sessionManager.getSession(identity.uid, identity.email || '');
       const { groupId, enableAll } = req.body;
       if (!groupId || typeof enableAll !== 'boolean') {
         return res.status(400).json({
@@ -1362,7 +1384,9 @@ async function startServer() {
 
   app.post('/api/groups/warn-limit', async (req, res) => {
     try {
-      const session = getSessionForReq(req);
+      const identity = await verifyFirebaseUserForReq(req, res);
+      if (!identity) return;
+      const session = sessionManager.getSession(identity.uid, identity.email || '');
       const { groupId, limit } = req.body;
       if (!groupId || typeof limit !== 'number') {
         return res.status(400).json({
