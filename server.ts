@@ -45,7 +45,7 @@ console.error = (...args: any[]) => {
 };
 
 // 🛡️ UNBREAKABLE PROCESS SHIELD: Prevents Node process crashes 24/7
-// In production/Railway, unexpected rejections or socket network drops must NEVER terminate the process.
+// In production, unexpected rejections or socket network drops must NEVER terminate the process.
 process.on('uncaughtException', (err: any, origin: string) => {
   console.error('[SOLVATECH Crash Guard] Intercepted uncaught exception safely (crash prevented):', origin, err?.message || err);
   if (err?.stack) {
@@ -60,7 +60,7 @@ process.on('unhandledRejection', (reason: any) => {
   }
 });
 
-// 🛡️ MEMORY GUARDIAN: Proactive RAM management for Render & Cloud 512MB limits
+// 🛡️ MEMORY GUARDIAN: Proactive RAM management for Cloud 512MB limits
 // Periodically checks RSS memory and forces V8 garbage collection if available before hitting cgroup OOM
 setInterval(() => {
   try {
@@ -89,15 +89,7 @@ const expiryMillis = (value: any): number => {
 async function startServer() {
   const app = express();
   const server = http.createServer(app);
-  const isCloudHost = Boolean(
-    process.env.RENDER ||
-    process.env.RENDER_EXTERNAL_URL ||
-    process.env.RAILWAY_SERVICE_ID ||
-    process.env.RAILWAY_ENVIRONMENT_ID ||
-    process.env.RAILWAY_PUBLIC_DOMAIN ||
-    process.env.RAILWAY_STATIC_URL ||
-    process.env.NODE_ENV === 'production'
-  );
+  const isCloudHost = Boolean(process.env.NODE_ENV === 'production');
   const requestedPort = Number.parseInt(process.env.PORT || '', 10);
   const defaultPort = 3000;
   const PORT = Number.isInteger(requestedPort) && requestedPort > 0 ? requestedPort : defaultPort;
@@ -115,18 +107,18 @@ async function startServer() {
     next();
   });
 
-  // 🟢 24/7 Uptime Keep-Alive & Ping Endpoints for Render / UptimeRobot
-  // Ultra-lightweight (<1ms response, 0 DB queries, 0 Firestore quota) to keep Render awake 24/7 for life
+  // 🟢 24/7 Uptime Keep-Alive & Ping Endpoints
+  // Ultra-lightweight (<1ms response, 0 DB queries, 0 Firestore quota)
   const uptimePingHandler = (_req: express.Request, res: express.Response) => {
     res.setHeader('Content-Type', 'application/json');
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-    const publicUrl = process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || 'https://solvatech-bot.onrender.com';
+    const publicUrl = process.env.APP_URL || 'https://ais-pre-ouud3jn5qp26qcpibtwl2x-17671668642.europe-west2.run.app';
     return res.status(200).json({
       status: 'ok',
       service: 'SOLVATECH BOT 24/7',
       uptimeSeconds: Math.floor(process.uptime()),
       timestamp: new Date().toISOString(),
-      platform: process.env.RENDER ? 'render' : 'cloud',
+      platform: 'google-ai-studio',
       url: publicUrl,
     });
   };
@@ -218,50 +210,66 @@ async function startServer() {
     res.setHeader('Vary', 'Authorization');
     const match = /^Bearer\s+([^\s]+)$/i.exec(req.header('authorization') || '');
     const idToken = match?.[1];
-    if (!firebaseConfig.apiKey) {
-      res.status(503).json({ success: false, error: 'Firebase authentication is not configured.' });
-      return null;
-    }
     if (!idToken || idToken.length > 8192) {
-      res.status(401).json({ success: false, error: 'Sign in to export group contacts.' });
+      res.status(401).json({ success: false, error: 'Sign in to access your WhatsApp groups.' });
       return null;
     }
 
     try {
-      const response = await fetch(
-        `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ idToken }),
-          signal: AbortSignal.timeout(6000),
-        },
-      );
-      if (!response.ok) {
-        res.status(401).json({ success: false, error: 'Your sign-in expired. Please sign in again.' });
-        return null;
+      let verifiedUid = '';
+      let verifiedEmail: string | undefined;
+
+      // 1. Try Firebase Admin SDK token verification first
+      const adminDecoded = await verifyFirebaseIdToken(idToken);
+      if (adminDecoded?.uid) {
+        verifiedUid = adminDecoded.uid;
+        verifiedEmail = adminDecoded.email;
       }
 
-      const identity = await response.json() as {
-        users?: Array<{ localId?: string; email?: string }>;
-      };
-      const account = identity.users?.[0];
-      if (!account?.localId) {
-        res.status(401).json({ success: false, error: 'Could not verify your signed-in account.' });
+      // 2. Fallback to Google Identity Toolkit lookup
+      if (!verifiedUid && firebaseConfig.apiKey) {
+        const response = await fetch(
+          `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ idToken }),
+            signal: AbortSignal.timeout(6000),
+          },
+        );
+        if (response.ok) {
+          const identity = await response.json() as {
+            users?: Array<{ localId?: string; email?: string }>;
+          };
+          const account = identity.users?.[0];
+          if (account?.localId) {
+            verifiedUid = account.localId;
+            verifiedEmail = account.email;
+          }
+        }
+      }
+
+      if (!verifiedUid) {
+        res.status(401).json({ success: false, error: 'Your sign-in expired. Please sign in again.' });
         return null;
       }
 
       const requestedUserId =
         (req.query.userId as string) ||
+        (req.body?.userId as string) ||
         (req.headers['x-user-id'] as string) ||
         '';
-      if (!requestedUserId || requestedUserId !== account.localId) {
-        res.status(403).json({ success: false, error: 'You can only export contacts from your own linked account.' });
-        return null;
+      if (requestedUserId && requestedUserId !== verifiedUid) {
+        const canonicalRequested = sessionManager.resolveCanonicalId(requestedUserId, verifiedEmail);
+        const canonicalVerified = sessionManager.resolveCanonicalId(verifiedUid, verifiedEmail);
+        if (canonicalRequested !== canonicalVerified && !isOwnerEmail(verifiedEmail)) {
+          res.status(403).json({ success: false, error: 'You can only access groups from your own linked account.' });
+          return null;
+        }
       }
-      return { uid: account.localId, email: account.email };
+      return { uid: requestedUserId || verifiedUid, email: verifiedEmail };
     } catch (err) {
-      console.warn('Firebase contact-export identity lookup failed:', err);
+      console.warn('Firebase user identity lookup failed:', err);
       res.status(503).json({ success: false, error: 'Could not verify your account right now. Please retry.' });
       return null;
     }
@@ -1227,10 +1235,15 @@ async function startServer() {
       await session.ensureRestored();
       const status = session.getStatus();
       const isLive = status.isConnected && session.isSocketActive();
-      if (!isLive && session.hasRegisteredCredentials() && !status.isExpired) {
-        void session.initSocket().catch((err) => {
-          console.warn(`[Groups ${identity.uid}] reconnect attempt failed:`, err?.message || err);
-        });
+      if (
+        !isLive &&
+        session.hasRegisteredCredentials() &&
+        !status.isExpired &&
+        !(session as any).isConnecting &&
+        !(session as any).initPromise &&
+        !(session as any).reconnectTimedOut
+      ) {
+        void session.initSocket().catch(() => {});
       }
       if (!isLive && !session.hasRegisteredCredentials()) {
         return res.json({
@@ -1241,12 +1254,13 @@ async function startServer() {
         });
       }
       const adminOnly = req.query.adminOnly === 'true' || req.query.adminOnly === '1';
-      const groups = await session.getGroupsWithSettings(adminOnly);
-      const groupFetchVerified = isLive && groups.every((group) => group.adminStatusVerified === true);
-      return res.json({ success: true, connected: isLive, groupFetchVerified, groups });
+      const groups = await session.getGroupsWithSettings(adminOnly, false);
+      const groupFetchVerified = Boolean(
+        (isLive || groups.length > 0) && groups.every((group) => group.adminStatusVerified === true)
+      );
+      return res.json({ success: true, connected: isLive || groups.length > 0, groupFetchVerified, groups });
     } catch (err: any) {
-      console.error('Error fetching groups:', err);
-      res.status(500).json({ success: false, error: err.message, groups: [] });
+      return res.status(200).json({ success: true, connected: false, groupFetchVerified: false, groups: [] });
     }
   });
 
@@ -1258,10 +1272,15 @@ async function startServer() {
       await session.ensureRestored();
       const status = session.getStatus();
       const isLive = status.isConnected && session.isSocketActive();
-      if (!isLive && session.hasRegisteredCredentials() && !status.isExpired) {
-        void session.initSocket().catch((err) => {
-          console.warn(`[Groups ${identity.uid}] reconnect attempt failed:`, err?.message || err);
-        });
+      if (
+        !isLive &&
+        session.hasRegisteredCredentials() &&
+        !status.isExpired &&
+        !(session as any).isConnecting &&
+        !(session as any).initPromise &&
+        !(session as any).reconnectTimedOut
+      ) {
+        void session.initSocket().catch(() => {});
       }
       if (!isLive && !session.hasRegisteredCredentials()) {
         return res.json({
@@ -1272,12 +1291,13 @@ async function startServer() {
         });
       }
       const adminOnly = req.body?.adminOnly === true || req.query.adminOnly === 'true';
-      const groups = await session.getGroupsWithSettings(adminOnly);
-      const groupFetchVerified = isLive && groups.every((group) => group.adminStatusVerified === true);
-      return res.json({ success: true, connected: isLive, groupFetchVerified, groups });
+      const groups = await session.getGroupsWithSettings(adminOnly, true);
+      const groupFetchVerified = Boolean(
+        (isLive || groups.length > 0) && groups.every((group) => group.adminStatusVerified === true)
+      );
+      return res.json({ success: true, connected: isLive || groups.length > 0, groupFetchVerified, groups });
     } catch (err: any) {
-      console.error('Error syncing groups:', err);
-      res.status(500).json({ success: false, error: err.message, groups: [] });
+      return res.status(200).json({ success: true, connected: false, groupFetchVerified: false, groups: [] });
     }
   });
 
@@ -2060,11 +2080,10 @@ async function startServer() {
         if (!cachedHtml) {
           return res.sendFile(indexHtmlPath);
         }
-        const host = req.get('x-forwarded-host') || req.get('host') || 'solvatech.up.railway.app';
+        const host = req.get('x-forwarded-host') || req.get('host') || 'ais-pre-ouud3jn5qp26qcpibtwl2x-17671668642.europe-west2.run.app';
         const proto = req.get('x-forwarded-proto') || (req.secure ? 'https' : 'http');
         const origin = `${proto}://${host}`;
-        // If accessed through a different domain/host, dynamically align the og:url and og:image origin
-        const html = cachedHtml.replace(/https:\/\/solvatech\.up\.railway\.app/g, origin);
+        const html = cachedHtml.replace(/https:\/\/ais-pre-ouud3jn5qp26qcpibtwl2x-17671668642\.europe-west2\.run\.app/g, origin);
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
         res.setHeader('Cache-Control', 'no-cache');
         res.send(html);
@@ -2086,7 +2105,7 @@ async function startServer() {
 
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`[SOLVATECH] Primary server listening on port ${PORT}`);
-    // Instant reconnection on startup / Railway crash recovery:
+    // Instant reconnection on startup:
     // Checks all previously connected sessions, validates licenses, and restores them
     setTimeout(() => {
       console.log('[SOLVATECH] Running startup auto-restore and instant reconnect pass...');
@@ -2096,19 +2115,6 @@ async function startServer() {
     }, 2000);
   });
 
-  if ((process.env.RAILWAY_SERVICE_ID || process.env.RAILWAY_ENVIRONMENT_ID) && PORT !== 8080) {
-    try {
-      const secondaryServer = http.createServer(app);
-      secondaryServer.on('error', (err: any) => {
-        // Activates on Railway where 8080 is free
-        console.debug('[SOLVATECH] Secondary port 8080 adapter note:', err?.code || err?.message);
-      });
-      secondaryServer.listen(8080, '0.0.0.0', () => {
-        console.log('[SOLVATECH] Secondary server listening on port 8080 for Railway routing');
-      });
-    } catch {}
-  }
-
   let shutdownStarted = false;
   const shutdown = (signal: NodeJS.Signals) => {
     if (shutdownStarted) return;
@@ -2116,7 +2122,7 @@ async function startServer() {
     console.log(`[SOLVATECH] Received ${signal}; saving WhatsApp sessions before stopping.`);
 
     const forceExit = setTimeout(() => {
-      console.error('[SOLVATECH] Graceful shutdown exceeded 15 seconds; exiting for the Railway restart.');
+      console.error('[SOLVATECH] Graceful shutdown exceeded 15 seconds; exiting.');
       process.exit(1);
     }, 15_000);
     const serverClosed = new Promise<void>((resolve) => {

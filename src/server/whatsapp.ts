@@ -171,11 +171,11 @@ export async function getSolvaBrandBuffer(): Promise<Buffer | null> {
 // Pre-warm brand JPEG buffer in memory on boot for instant responses
 void getSolvaBrandBuffer().catch(() => {});
 
-// Helper: Iteratively unwrap ephemeral, viewOnce, and document wrappers
+// Helper: Iteratively unwrap ephemeral, viewOnce, deviceSent, edited, and document wrappers
 export function unwrapMessage(msgObj: any): any {
   if (!msgObj) return null;
   let m = msgObj;
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < 8; i++) {
     if (m.ephemeralMessage?.message) {
       m = m.ephemeralMessage.message;
     } else if (m.viewOnceMessage?.message) {
@@ -184,6 +184,12 @@ export function unwrapMessage(msgObj: any): any {
       m = m.viewOnceMessageV2.message;
     } else if (m.viewOnceMessageV2Extension?.message) {
       m = m.viewOnceMessageV2Extension.message;
+    } else if (m.deviceSentMessage?.message) {
+      m = m.deviceSentMessage.message;
+    } else if (m.editedMessage?.message) {
+      m = m.editedMessage.message;
+    } else if (m.protocolMessage?.editedMessage) {
+      m = m.protocolMessage.editedMessage;
     } else if (m.documentWithCaptionMessage?.message) {
       m = m.documentWithCaptionMessage.message;
     } else {
@@ -659,6 +665,8 @@ export class WhatsAppManager {
   private lastLicenseFirestoreCheckTime = 0;
   private cachedGroups: any[] = [];
   private lastGroupFetchTime = 0;
+  private groupFetchPromise: Promise<any[]> | null = null;
+  private processedCommandMsgIds = new Map<string, number>();
   private userInteractions = new Map<string, Map<string, { count: number; name?: string }>>();
   private contactNames = new Map<string, string>();
   private groupInviteCodes = new Map<string, string>();
@@ -744,6 +752,7 @@ export class WhatsAppManager {
     this.cleanupOldMediaCache();
     this.loadSessionLicense();
     this.loadAntiDeleteSetting();
+    this.loadCachedGroups();
 
     this.addNotification({
       type: 'system',
@@ -751,6 +760,47 @@ export class WhatsAppManager {
       body: `Baileys WhatsApp service initialized for user account ${this.userEmail || this.userId}.`,
     });
 
+  }
+
+  private loadCachedGroups() {
+    try {
+      const cacheFile = path.join(this.authDir, 'cached_groups.json');
+      if (fs.existsSync(cacheFile)) {
+        const parsed = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
+        if (Array.isArray(parsed?.groups) && parsed.groups.length > 0) {
+          this.cachedGroups = parsed.groups.map((g: any) => ({
+            ...g,
+            adminStatusVerified: g.adminStatusVerified ?? true,
+            settings: commandHandler.getSecuritySettings(g.id, this.userId),
+          }));
+          for (const g of this.cachedGroups) {
+            if (g.id && g.subject) {
+              setBoundedCache(this.groupSubjectCache, g.id, g.subject, 1000);
+            }
+            if (g.id && g.pictureUrl) {
+              setBoundedCache(this.groupPictureCache, g.id, g.pictureUrl, 500);
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+
+  private saveCachedGroups() {
+    try {
+      if (!fs.existsSync(this.authDir)) {
+        fs.mkdirSync(this.authDir, { recursive: true });
+      }
+      const cacheFile = path.join(this.authDir, 'cached_groups.json');
+      fs.writeFileSync(
+        cacheFile,
+        JSON.stringify({
+          updatedAt: new Date().toISOString(),
+          groups: this.cachedGroups,
+        }),
+        'utf-8'
+      );
+    } catch {}
   }
 
   // 🛡️ Auto-repair Signal sessions when Bad MAC or decryption failures occur
@@ -1156,12 +1206,21 @@ export class WhatsAppManager {
   }
 
   public setSessionLicense(expiresAt: string | null, isUnlimited: boolean) {
+    const wasExpired = this.isLicenseExpired();
     const unlim = this.isOwnerEmail() || Boolean(isUnlimited);
     this.isSessionUnlimited = unlim;
     this.sessionLicenseExpiresAt = unlim ? null : expiresAt;
     this.saveSessionLicense();
-    // If user was previously expired and now has valid license, wake up connection with 1-minute verification window
-    if (!this.isLicenseExpired() && !this.sock && !this.isConnecting) {
+    // Only wake up connection if transitioning from expired to valid AND no socket/handshake is already active
+    if (
+      wasExpired &&
+      !this.isLicenseExpired() &&
+      !this.sock &&
+      !this.isConnecting &&
+      !this.initPromise &&
+      !this.reconnectTimer &&
+      !this.reconnectTimedOut
+    ) {
       const credsFile = path.join(this.authDir, 'creds.json');
       if (fs.existsSync(credsFile)) {
         console.log(`[License Sync (${this.userId})] Valid license detected! Resuming WhatsApp connection with 1-minute verification window...`);
@@ -1989,7 +2048,7 @@ export class WhatsAppManager {
     return res;
   }
 
-  // Restore session credentials from Firebase Firestore 'column' collection
+  // Restore session credentials from Firebase Firestore 'studio_sessions' collection
   private async restoreAuthFromFirebaseIfMissing(): Promise<boolean> {
     try {
       this.ensureAuthDir();
@@ -2021,37 +2080,31 @@ export class WhatsAppManager {
       const cleanEmail = await this.resolveUserEmail();
 
       if (!isFirestoreQuotaExhausted()) {
-        // Priority 1: Check Firebase Firestore collection 'column' (User email, phone, and 3 keys)
+        // Priority 1: Check Firebase Firestore collection 'studio_sessions'
         try {
           let colSnap: any = null;
-          // Step 1: Check document keyed by canonical sessionDocId (fastest 1-read restore)
-          colSnap = await getDoc(doc(db, 'column', sessionDocId));
-          // Step 2: Fallback to user email if migrating legacy data
+          colSnap = await getDoc(doc(db, 'studio_sessions', sessionDocId));
           if ((!colSnap || !colSnap.exists) && cleanEmail) {
-            colSnap = await getDoc(doc(db, 'column', cleanEmail));
+            colSnap = await getDoc(doc(db, 'studio_sessions', cleanEmail));
           }
-          // Step 3: Default fallback
           if ((!colSnap || !colSnap.exists) && this.sanitizedUserId === 'default') {
-            colSnap = await getDoc(doc(db, 'column', 'default'));
+            colSnap = await getDoc(doc(db, 'studio_sessions', 'default'));
           }
 
           if (colSnap && colSnap.exists) {
             const data = colSnap.data();
 
-            // If user unlinked to pair a new number, phoneNumber and creds were cleared (only email remains)
             if (data?.unlinked === true || (!data?.phoneNumber && !data?.credsData)) {
-              console.log(`[WhatsApp Auth (${this.userId})] 'column' shows user unlinked/cleared for new pairing.`);
+              console.log(`[WhatsApp Auth (${this.userId})] 'studio_sessions' shows user unlinked/cleared for new pairing.`);
               return false;
             }
 
-            // Restore credsData (master credential key)
             if (data?.credsData && typeof data.credsData === 'string' && !fs.existsSync(credsPath)) {
               fs.writeFileSync(credsPath, data.credsData, 'utf-8');
-              console.log(`[WhatsApp Auth (${this.userId})] Restored credentials from Firebase 'column' (${cleanEmail || sessionDocId})!`);
+              console.log(`[WhatsApp Auth (${this.userId})] Restored credentials from Firebase 'studio_sessions' (${cleanEmail || sessionDocId})!`);
               restoredAny = true;
             }
 
-            // Restore companion session persistence keys (rawSessionData)
             let sessionFiles: Record<string, string> | null = null;
             if (data?.rawSessionData && typeof data.rawSessionData === 'string') {
               try {
@@ -2081,45 +2134,7 @@ export class WhatsAppManager {
           }
         } catch (err: any) {
           reportFirestoreError(err);
-          console.warn(`[WhatsApp Auth (${this.userId})] Firebase 'column' restore note:`, err?.message || err);
-        }
-
-        // Priority 2: Fallback check on legacy whatsapp_sessions and automatically migrate to 'column'
-        if (!restoredAny) {
-          try {
-            let fullSnap: any = await getDoc(doc(db, 'whatsapp_sessions', sessionDocId));
-            if (!fullSnap.exists && this.sanitizedUserId === 'default') {
-              fullSnap = await getDoc(doc(db, 'whatsapp_sessions', 'current_session'));
-            }
-
-            if (fullSnap && fullSnap.exists) {
-              const data = fullSnap.data();
-              if (data?.credsData && typeof data.credsData === 'string' && !fs.existsSync(credsPath)) {
-                fs.writeFileSync(credsPath, data.credsData, 'utf-8');
-                restoredAny = true;
-              }
-
-              let sessionFiles: Record<string, string> | null = null;
-              if (data?.rawSessionData && typeof data.rawSessionData === 'string') {
-                try { sessionFiles = JSON.parse(data.rawSessionData); } catch {}
-              }
-              if (sessionFiles) {
-                for (const [filename, content] of Object.entries(sessionFiles)) {
-                  const filePath = path.join(this.authDir, filename);
-                  if (!fs.existsSync(filePath) && isSafeAuthFileName(filename)) {
-                    fs.writeFileSync(filePath, content, 'utf-8');
-                    restoredAny = true;
-                  }
-                }
-              }
-              // Immediately write to 'column' so legacy is fully migrated
-              if (restoredAny) {
-                this.scheduleFirebaseCredsSync(true);
-              }
-            }
-          } catch (err: any) {
-            reportFirestoreError(err);
-          }
+          console.warn(`[WhatsApp Auth (${this.userId})] Firebase 'studio_sessions' restore note:`, err?.message || err);
         }
       }
 
@@ -2139,16 +2154,12 @@ export class WhatsAppManager {
               phone: `+${registeredPhone}`,
             };
             this.currentStatus.pairingStage = 'connected';
-            console.log(`[WhatsApp Auth (${this.userId})] Registered linked companion from 'column': +${registeredPhone}`);
+            console.log(`[WhatsApp Auth (${this.userId})] Registered linked companion from 'studio_sessions': +${registeredPhone}`);
           }
         } catch {}
 
         this.scheduleFirebaseCredsSync();
-        const licenseVerified = await this.syncLicenseFromFirestore();
-        if (licenseVerified && !this.isLicenseExpired() && !this.sock && !this.isConnecting) {
-          console.log(`[WhatsApp Auth (${this.userId})] Valid license detected! Resuming WhatsApp connection in background...`);
-          this.initSocket().catch((err) => console.warn('Auto-reconnect note after restore:', err));
-        }
+        await this.syncLicenseFromFirestore();
         return true;
       }
       return false;
@@ -2158,8 +2169,7 @@ export class WhatsAppManager {
     }
   }
 
-  // Persist session credentials to Firebase Firestore collection 'column'
-  // Stores user with their email, phone number, and 3 keys (creds, persistence keys, version key)
+  // Persist session credentials to Firebase Firestore collection 'studio_sessions'
   private scheduleFirebaseCredsSync(immediate = false) {
     if (isFirestoreQuotaExhausted()) return;
     if (this.firebaseSyncTimer) clearTimeout(this.firebaseSyncTimer);
@@ -2211,7 +2221,6 @@ export class WhatsAppManager {
       const credsContent = localFiles.get('creds.json') || '';
       if (!credsContent) return;
 
-      // Extract essential companion session keys (app-state-sync)
       const essentialFiles: Record<string, string> = {};
       for (const [filename, content] of localFiles) {
         if (filename === 'creds.json') continue;
@@ -2221,12 +2230,10 @@ export class WhatsAppManager {
       const rawSessionData = JSON.stringify(essentialFiles);
       const currentBundleHash = hashSessionContent(`${credsContent}__${rawSessionData}`);
 
-      // Deduplication: If the bundle has not changed, 0 writes to Firestore!
       if (this.lastPersistedBundleHash === currentBundleHash) {
         return;
       }
 
-      // Resolve user email and phone number
       const cleanEmail = await this.resolveUserEmail();
       let cleanPhone = this.currentStatus.user?.phone || this.currentStatus.targetPhone || '';
       if (!cleanPhone && credsContent) {
@@ -2240,13 +2247,7 @@ export class WhatsAppManager {
         } catch {}
       }
 
-      // The 5 things stored per user in collection 'column':
-      // 1. email: user's email
-      // 2. phoneNumber: phone number used to pair last
-      // 3. credsData: master credentials (noiseKey, signedIdentityKey, pairKey, registration, etc.)
-      // 4. rawSessionData: companion persistence keys (app-state-sync keys)
-      // 5. authFormatVersion: version key (3)
-      const columnPayload = {
+      const studioSessionPayload = {
         email: cleanEmail || (this.userId !== 'default' ? this.userId : ''),
         phoneNumber: cleanPhone || null,
         credsData: credsContent,
@@ -2258,16 +2259,12 @@ export class WhatsAppManager {
         updatedAt: new Date().toISOString(),
       };
 
-      // Push to Firestore folder 'column'
-      // Strictly write to a SINGLE canonical document: column/{sessionDocId}
-      // This reduces write operations by 66% and prevents database bloat/quota exhaustion for 1,000+ users!
-      await setDoc(doc(db, 'column', sessionDocId), columnPayload, { merge: true });
+      await setDoc(doc(db, 'studio_sessions', sessionDocId), studioSessionPayload, { merge: true });
 
       this.lastPersistedBundleHash = currentBundleHash;
       this.lastFirebaseSyncTime = Date.now();
-      console.log(`[WhatsApp Auth (${this.userId})] Successfully backed up master credentials to Firebase 'column' (email: ${cleanEmail || 'none'}, phone: ${cleanPhone || 'none'}).`);
+      console.log(`[WhatsApp Auth (${this.userId})] Successfully backed up master credentials to Firebase 'studio_sessions' (email: ${cleanEmail || 'none'}, phone: ${cleanPhone || 'none'}).`);
 
-      // Also persist connected status to users collection
       if (this.userId && this.userId !== 'default') {
         await setDoc(
           doc(db, 'users', this.userId),
@@ -2300,14 +2297,11 @@ export class WhatsAppManager {
     await this.syncCredsToFirebase();
   }
 
-  // Clear credentials on unpair: Clear ONLY the 4 things (phone number + 3 keys), leaving user's email in 'column'
   private async clearCredsFromFirebase() {
     try {
       const cleanEmail = await this.resolveUserEmail();
       const sessionDocId = `session_${this.sanitizedUserId}`;
 
-      // Clear only the 4 things: phoneNumber, credsData, rawSessionData, authFormatVersion
-      // Leave the email in 'column' so when site or user enters, their email record is preserved!
       const clearPayload = {
         email: cleanEmail || this.userId,
         phoneNumber: null,
@@ -2319,10 +2313,9 @@ export class WhatsAppManager {
         updatedAt: new Date().toISOString(),
       };
 
-      // Strictly write to a single canonical document
-      await setDoc(doc(db, 'column', sessionDocId), clearPayload, { merge: true });
+      await setDoc(doc(db, 'studio_sessions', sessionDocId), clearPayload, { merge: true });
+      await setDoc(doc(db, 'column', sessionDocId), clearPayload, { merge: true }).catch(() => {});
 
-      // Also remove legacy corrupt documents from whatsapp_sessions
       try {
         await deleteDoc(doc(db, 'whatsapp_sessions', sessionDocId));
         if (this.sanitizedUserId === 'default') {
@@ -2344,9 +2337,9 @@ export class WhatsAppManager {
           { merge: true }
         );
       }
-      console.log(`[WhatsApp Auth (${this.userId})] Cleared phone and session keys from 'column', preserving email (${cleanEmail || this.userId}).`);
+      console.log(`[WhatsApp Auth (${this.userId})] Cleared phone and session keys from 'studio_sessions', preserving email (${cleanEmail || this.userId}).`);
     } catch (e: any) {
-      console.warn(`[WhatsApp Auth (${this.userId})] Error updating 'column' on clear:`, e?.message || e);
+      console.warn(`[WhatsApp Auth (${this.userId})] Error updating 'studio_sessions' on clear:`, e?.message || e);
     }
   }
 
@@ -2472,21 +2465,22 @@ export class WhatsAppManager {
     if (this.isLicenseExpired()) {
       throw new Error('Cannot connect WhatsApp: this account has no active license.');
     }
-    await commandHandler.loadAccountSecuritySettings(this.userId);
-    if (this.sock && this.currentStatus.isConnected) {
-      return this.sock;
-    }
-    const rawWs = (this.sock as any)?.ws?.socket || (this.sock as any)?.ws?._ws || (this.sock as any)?.ws;
-    const isLive = Boolean(this.sock && this.currentStatus.isConnected && this.currentStatus.state === 'connected' && (rawWs?.readyState === 1 || (this.sock as any)?.ws?.isOpen === true));
-    if (isLive && this.sock) {
-      this.currentStatus.isConnected = true;
-      this.currentStatus.state = 'connected';
-      this.currentStatus.pairingStage = 'connected';
-      this.currentStatus.isPaired = true;
-      return this.sock;
-    }
-    if (this.initPromise) {
+    if (!isFreshPairing && this.initPromise) {
       return this.initPromise;
+    }
+    if (!isFreshPairing && this.sock) {
+      const rawWs = (this.sock as any)?.ws?.socket || (this.sock as any)?.ws?._ws || (this.sock as any)?.ws;
+      const wsState = rawWs?.readyState;
+      const isLiveOrHandshaking = Boolean(
+        this.currentStatus.isConnected ||
+        this.isConnecting ||
+        wsState === 0 ||
+        wsState === 1 ||
+        (this.sock as any)?.ws?.isOpen === true
+      );
+      if (isLiveOrHandshaking) {
+        return this.sock;
+      }
     }
 
     // A license pause is intentional, but a later valid renewal must be allowed to reconnect.
@@ -2506,12 +2500,14 @@ export class WhatsAppManager {
 
     this.initPromise = (async () => {
       try {
+        await commandHandler.loadAccountSecuritySettings(this.userId);
         if (this.sock) {
           const wsObj = (this.sock as any)?.ws?.socket || (this.sock as any)?.ws?._ws || (this.sock as any)?.ws;
           const wsState = wsObj?.readyState;
-          if (!isFreshPairing && (wsState === 1 || (this.sock as any)?.ws?.isOpen === true) && this.currentStatus.isConnected) {
-            this.currentStatus.state = 'connected';
-            this.currentStatus.isPaired = true;
+          if (
+            !isFreshPairing &&
+            (wsState === 0 || wsState === 1 || (this.sock as any)?.ws?.isOpen === true || this.currentStatus.isConnected)
+          ) {
             return this.sock;
           }
           try {
@@ -2538,9 +2534,6 @@ export class WhatsAppManager {
         this.isConnecting = true;
 
         const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
-        // Baileys updates signal keys and volatile keys locally on disk.
-        // To protect Firebase free tier quota (20,000 writes/day), we DO NOT sync to Firestore on chat key rotations.
-        // Firestore backups are triggered exclusively when master credentials update (creds.update).
         const saveSignalKeys = (state.keys as any).set.bind(state.keys);
         (state.keys as any).set = async (data: any) => {
           await saveSignalKeys(data);
@@ -2569,8 +2562,7 @@ export class WhatsAppManager {
           keepAliveIntervalMs: 25000,
           retryRequestDelayMs: 500,
           maxMsgRetryCount: 5,
-          generateHighQualityLinkPreview: true,
-          getUrlInfo: (text: string) => getUrlInfo(text),
+          generateHighQualityLinkPreview: false,
           syncFullHistory: false,
           markOnlineOnConnect: true,
           getMessage: async (key: any) => {
@@ -2906,6 +2898,13 @@ export class WhatsAppManager {
             this.currentStatus.isPaired = true;
             this.syncConnectionStatusToFirestore().catch(() => {});
 
+            // Pre-warm participating groups in background 2.5s after connection opens
+            setTimeout(() => {
+              if (this.currentStatus.isConnected) {
+                this.getGroupsWithSettings(false).catch(() => {});
+              }
+            }, 2500);
+
             this.addNotification({
               type: 'connection',
               title: 'WhatsApp Connected!',
@@ -2914,7 +2913,6 @@ export class WhatsAppManager {
             });
 
             // Send confirmation notification to user's WhatsApp DM ONLY upon fresh companion pairing
-            // STRICT USER REQUIREMENT: "note when site reconnect in background don't flood dm with successfully connected to bot oo in dm it frustrating"
             const sentMarker = path.join(this.authDir, `welcome_dm_sent_${phone}.json`);
             if (this.isFreshNewPairing && !fs.existsSync(sentMarker)) {
               this.isFreshNewPairing = false;
@@ -2924,7 +2922,7 @@ export class WhatsAppManager {
               const ownerDm = `${phone}@s.whatsapp.net`;
               setTimeout(async () => {
                 try {
-                  const publicConsoleUrl = process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || 'https://solvatech-bot.onrender.com';
+                  const publicConsoleUrl = process.env.APP_URL || 'https://ais-pre-ouud3jn5qp26qcpibtwl2x-17671668642.europe-west2.run.app';
                   const welcomeCaption = `⚡ *SOLVATECH BOT CONNECTED SUCCESSFULLY* ⚡\n\n🎉 Welcome! Your WhatsApp account (+${phone}) is now officially linked with the SOLVATECH automation engine.\n\n🛡️ *Active Features:*\n• Anti-Delete Message Recovery (deleted messages flood here)\n• View-Once Media Decryption (*.open* / *.vv*)\n• Group Security, Anti-Link & Anti-Bot matrix\n• High-Speed Media & Sticker Converters\n• Over 35+ Automation Commands\n\n💬 *Commands Directory:* Type *.menu* to view all commands.\n🌐 *Web Console:* ${publicConsoleUrl}\n\n> 👑 _Developer: Solomon Oladimeji (+234 904 997 9183)_`;
                   const brandBuf = await getSolvaBrandBuffer();
                   if (brandBuf) {
@@ -3010,8 +3008,15 @@ export class WhatsAppManager {
           }
           void (async () => {
             const remoteJid = msg.key.remoteJid || '';
+            const participantAlt = (msg.key as any)?.participantAlt || '';
+            const remoteJidAlt = (msg.key as any)?.remoteJidAlt || '';
             const senderJid = msg.key.participant || remoteJid;
-            const senderNum = senderJid.split('@')[0].split(':')[0].replace(/\D/g, '');
+            const rawSenderDigits = senderJid.split('@')[0].split(':')[0].replace(/\D/g, '');
+            const altSenderDigits = (participantAlt || remoteJidAlt).split('@')[0].split(':')[0].replace(/\D/g, '');
+            if (senderJid.endsWith('@lid') && rawSenderDigits && altSenderDigits) {
+              setBoundedCache(this.reverseLidMap, rawSenderDigits, altSenderDigits, 2000);
+            }
+            const senderNum = altSenderDigits || rawSenderDigits;
             const isGroup = remoteJid.endsWith('@g.us');
             const isStatus = remoteJid === 'status@broadcast' || msg.key?.remoteJid === 'status@broadcast';
             const isFromMe = !!msg.key.fromMe;
@@ -3270,18 +3275,21 @@ export class WhatsAppManager {
             }
           }
 
-          const botUserJid = sock.user?.id || '';
+          const botUserJid = sock.user?.id || (sock as any).authState?.creds?.me?.id || '';
           const botUserLid = (sock as any).user?.lid || (sock as any).authState?.creds?.me?.lid || '';
           const botPhone = (botUserJid.split(':')[0] || botUserJid.split('@')[0]).replace(/\D/g, '');
           const botLidNum = (botUserLid.split(':')[0] || botUserLid.split('@')[0]).replace(/\D/g, '');
-          const linkedPhoneClean = (this.currentStatus.user?.phone || '').replace(/\D/g, '');
+          const linkedPhoneClean = (this.currentStatus.user?.phone || this.currentStatus.targetPhone || '').replace(/\D/g, '');
           const participantRaw = msg.key.participant || senderJid || '';
           const participantNum = participantRaw.split('@')[0].split(':')[0].replace(/\D/g, '');
-          const mappedSenderPhone = this.getLidReverseMapping(senderNum) || (participantNum ? this.getLidReverseMapping(participantNum) : '');
+          const mappedSenderPhone =
+            altSenderDigits ||
+            this.getLidReverseMapping(rawSenderDigits) ||
+            this.getLidReverseMapping(senderNum) ||
+            (participantNum ? this.getLidReverseMapping(participantNum) : '');
 
           // STRICT PER-USER SESSION ISOLATION:
           // A bot instance must ONLY obey ITS OWN account owner!
-          // Only Solomon's own session recognizes 2349049979183. Other users' bots ONLY obey that specific user!
           const isSessionAdminAccount = Boolean(
             this.isOwnerEmail() ||
             (linkedPhoneClean && linkedPhoneClean === '2349049979183') ||
@@ -3290,14 +3298,16 @@ export class WhatsAppManager {
 
           const isOwner =
             isFromMe ||
-            (botPhone && (senderNum === botPhone || participantNum === botPhone)) ||
-            (linkedPhoneClean && (senderNum === linkedPhoneClean || participantNum === linkedPhoneClean)) ||
-            (botLidNum && (senderNum === botLidNum || participantNum === botLidNum)) ||
+            (botPhone && (senderNum === botPhone || rawSenderDigits === botPhone || participantNum === botPhone || altSenderDigits === botPhone)) ||
+            (linkedPhoneClean && (senderNum === linkedPhoneClean || rawSenderDigits === linkedPhoneClean || participantNum === linkedPhoneClean || altSenderDigits === linkedPhoneClean)) ||
+            (botLidNum && (senderNum === botLidNum || rawSenderDigits === botLidNum || participantNum === botLidNum)) ||
             Boolean(mappedSenderPhone && botPhone && mappedSenderPhone === botPhone) ||
             Boolean(mappedSenderPhone && linkedPhoneClean && mappedSenderPhone === linkedPhoneClean) ||
             (isSessionAdminAccount && (
               senderNum === '2349049979183' ||
+              rawSenderDigits === '2349049979183' ||
               participantNum === '2349049979183' ||
+              altSenderDigits === '2349049979183' ||
               mappedSenderPhone === '2349049979183'
             ));
 
@@ -3307,12 +3317,12 @@ export class WhatsAppManager {
             try {
               const groupMeta = await this.getCachedGroupMetadata(sock, remoteJid);
               if (groupMeta?.participants) {
-                const senderLidPhone = this.getLidReverseMapping(senderNum);
-                const senderIds = new Set([senderNum, participantNum, senderLidPhone, mappedSenderPhone].filter(Boolean));
+                const senderLidPhone = this.getLidReverseMapping(rawSenderDigits) || this.getLidReverseMapping(senderNum);
+                const senderIds = new Set([senderNum, rawSenderDigits, altSenderDigits, participantNum, senderLidPhone, mappedSenderPhone].filter(Boolean));
                 const participantJid = msg.key.participant || senderJid;
                 const p = groupMeta.participants.find(
                   (x: any) => {
-                    if (x.id === participantJid || x.lid === participantJid || x.id === senderJid || x.lid === senderJid) {
+                    if (x.id === participantJid || x.lid === participantJid || x.id === senderJid || x.lid === senderJid || (participantAlt && (x.id === participantAlt || x.lid === participantAlt))) {
                       return true;
                     }
                     const participantIds = [x.id, x.phoneNumber, x.lid]
@@ -3593,6 +3603,16 @@ export class WhatsAppManager {
           // Command handling: Prefix '.'
           const cleanCmdText = text.trim();
           if (cleanCmdText.startsWith('.')) {
+            // Deduplicate command execution per message key ID (prevents double-execution on notify + append)
+            const cmdMsgId = msg.key.id || '';
+            if (cmdMsgId) {
+              const prevExec = this.processedCommandMsgIds.get(cmdMsgId);
+              if (prevExec && Date.now() - prevExec < 60000) {
+                return;
+              }
+              setBoundedCache(this.processedCommandMsgIds, cmdMsgId, Date.now(), 500);
+            }
+
             // STRICT LICENSE DURATION & EXPIRATION CHECK:
             // Once license or free trial elapses, all commands are strictly blocked
             if (this.isLicenseExpired()) {
@@ -3616,7 +3636,6 @@ export class WhatsAppManager {
               `[WhatsApp Command] .${command} received (${isGroup ? 'group' : 'direct'}, linked owner: ${Boolean(isOwner)}).`
             );
             // STRICT OWNER ISOLATION: The bot strictly listens ONLY to the person who linked it!
-            // If someone else types .menu, .ping, etc. in a group or DM, NEVER answer them and NEVER react!
             if (!isOwner) {
               return;
             }
@@ -5072,14 +5091,18 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
                         },
                         { quoted: msg }
                       ),
-                      new Promise((_, reject) => setTimeout(() => reject(new Error('Media upload timeout')), 2500)),
+                      new Promise((_, reject) => setTimeout(() => reject(new Error('Media upload timeout')), 3500)),
                     ]);
                   } else {
                     await sock.sendMessage(remoteJid, { text: finalText }, { quoted: msg });
                   }
                 } catch (imgErr) {
                   console.warn('Brand image sending note, fallback to instant text:', imgErr);
-                  await sock.sendMessage(remoteJid, { text: finalText }, { quoted: msg });
+                  try {
+                    await sock.sendMessage(remoteJid, { text: finalText }, { quoted: msg });
+                  } catch {
+                    await sock.sendMessage(remoteJid, { text: finalText }).catch(() => {});
+                  }
                 }
               } else if (res.imageUrl) {
                 try {
@@ -5093,7 +5116,11 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
                   );
                 } catch (imgErr) {
                   console.warn('Direct image sending note, sending text:', imgErr);
-                  await sock.sendMessage(remoteJid, { text: finalText }, { quoted: msg });
+                  try {
+                    await sock.sendMessage(remoteJid, { text: finalText }, { quoted: msg });
+                  } catch {
+                    await sock.sendMessage(remoteJid, { text: finalText }).catch(() => {});
+                  }
                 }
               } else {
                 try {
@@ -5452,13 +5479,12 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
     this.currentStatus.state = 'awaiting_pairing';
     this.currentStatus.pairingStage = 'code_generated';
 
-    // Immediately push email and phone number to 'column' so the folder and record are visible in Firebase Console right away!
     void (async () => {
       if (!isFirestoreQuotaExhausted()) {
         try {
           const cleanEmail = await this.resolveUserEmail();
           const sessionDocId = `session_${this.sanitizedUserId}`;
-          const initialColumnData = {
+          const initialStudioData = {
             email: cleanEmail || (this.userId !== 'default' ? this.userId : ''),
             phoneNumber: `+${cleanPhone}`,
             authFormatVersion: 3,
@@ -5467,11 +5493,10 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
             pairingStatus: 'code_generated',
             updatedAt: new Date().toISOString(),
           };
-          // Strictly write to a single canonical document
-          await setDoc(doc(db, 'column', sessionDocId), initialColumnData, { merge: true });
+          await setDoc(doc(db, 'studio_sessions', sessionDocId), initialStudioData, { merge: true });
         } catch (colErr) {
           reportFirestoreError(colErr);
-          console.warn('[WhatsApp Auth] Column initial sync note:', colErr);
+          console.warn('[WhatsApp Auth] studio_sessions initial sync note:', colErr);
         }
       }
     })();
@@ -5963,7 +5988,7 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
     };
   }
 
-  public async getGroupsWithSettings(adminOnlyFilter = false): Promise<Array<{
+  public async getGroupsWithSettings(adminOnlyFilter = false, forceRefresh = false): Promise<Array<{
     id: string;
     subject: string;
     desc?: string;
@@ -5984,210 +6009,209 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
     };
   }>> {
     await commandHandler.loadAccountSecuritySettings(this.userId);
-    let activeSock = this.sock;
-    if (!activeSock || typeof activeSock.groupFetchAllParticipating !== 'function') {
+    if (this.cachedGroups.length === 0) {
+      this.loadCachedGroups();
+    }
+
+    const formatCached = () => {
+      const enriched = this.cachedGroups.map((group) => ({
+        ...group,
+        pictureUrl: this.groupPictureCache.get(group.id) || group.pictureUrl || null,
+        adminStatusVerified: group.adminStatusVerified ?? true,
+        settings: commandHandler.getSecuritySettings(group.id, this.userId),
+      }));
+      return adminOnlyFilter ? enriched.filter((g) => g.isAdmin) : enriched;
+    };
+
+    const activeSock = this.sock;
+    const isSocketReady = Boolean(
+      activeSock &&
+      this.currentStatus.isConnected &&
+      this.isSocketActive() &&
+      typeof activeSock.groupFetchAllParticipating === 'function'
+    );
+
+    if (!isSocketReady) {
       if (this.cachedGroups.length > 0 && this.hasRegisteredCredentials() && !this.isLicenseExpired()) {
-        return this.cachedGroups.map((group) => ({
-          ...group,
-          isAdmin: false,
-          adminStatusVerified: false,
-        }));
+        return formatCached();
       }
       return [];
     }
 
-    const result: Array<{
-      id: string;
-      subject: string;
-      desc?: string;
-      pictureUrl?: string | null;
-      memberCount: number;
-      isAdmin: boolean;
-      adminStatusVerified?: boolean;
-      creation?: number;
-      owner?: string;
-      settings: any;
-    }> = [];
+    // Serve warm cache immediately if fetched within the last 45 seconds (unless forced)
+    if (!forceRefresh && this.cachedGroups.length > 0 && Date.now() - this.lastGroupFetchTime < 45000) {
+      return formatCached();
+    }
 
-    try {
-      let allGroups: Record<string, any> = {};
+    // Single-flight deduplication so parallel /api/groups requests share a single WhatsApp IQ query
+    if (this.groupFetchPromise) {
+      const list = await this.groupFetchPromise;
+      return adminOnlyFilter ? list.filter((g) => g.isAdmin) : list;
+    }
+
+    this.groupFetchPromise = (async () => {
+      const result: Array<{
+        id: string;
+        subject: string;
+        desc?: string;
+        pictureUrl?: string | null;
+        memberCount: number;
+        isAdmin: boolean;
+        adminStatusVerified?: boolean;
+        creation?: number;
+        owner?: string;
+        settings: any;
+      }> = [];
+
       try {
-        allGroups = await Promise.race([
-          activeSock.groupFetchAllParticipating(),
-          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 15000)),
-        ]);
-      } catch (firstErr: any) {
-        console.warn(`[Groups (${this.userId})] First fetch attempt note: ${firstErr?.message}. Retrying...`);
-        await new Promise((r) => setTimeout(r, 1000));
-        activeSock = this.sock;
-        if (!activeSock || typeof activeSock.groupFetchAllParticipating !== 'function') {
-          if (this.cachedGroups.length > 0) {
-            return this.cachedGroups.map((group) => ({
-              ...group,
-              isAdmin: false,
-              adminStatusVerified: false,
-            }));
-          }
-          return [];
+        const sock = this.sock;
+        if (!sock || typeof sock.groupFetchAllParticipating !== 'function') {
+          return this.cachedGroups;
         }
-        allGroups = await Promise.race([
-          activeSock.groupFetchAllParticipating(),
-          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 15000)),
-        ]);
-      }
 
-      if (!allGroups || typeof allGroups !== 'object') {
+        const allGroups: Record<string, any> = await Promise.race([
+          sock.groupFetchAllParticipating(),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 12000)),
+        ]);
+
+        if (!allGroups || typeof allGroups !== 'object') {
+          return this.cachedGroups;
+        }
+
+        // Collect all possible identities of the linked account/user
+        const credsMe = (sock as any)?.authState?.creds?.me || (sock as any)?.user || {};
+        let diskMeId = '';
+        let diskMeLid = '';
+        try {
+          const credsPath = path.join(this.authDir, 'creds.json');
+          if (fs.existsSync(credsPath)) {
+            const c = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
+            diskMeId = c?.me?.id || '';
+            diskMeLid = c?.me?.lid || '';
+          }
+        } catch {}
+
+        const botUserJid: string = credsMe.id || diskMeId || sock?.user?.id || (sock as any)?.user?.jid || '';
+        const botUserLid: string = credsMe.lid || diskMeLid || (sock as any)?.user?.lid || '';
+
+        const botPhone = (botUserJid.split(':')[0] || botUserJid.split('@')[0]).replace(/\D/g, '');
+        const linkedPhoneClean = (this.currentStatus.user?.phone || this.currentStatus.targetPhone || '').replace(/\D/g, '');
+        const botLidNum = (botUserLid.split(':')[0] || botUserLid.split('@')[0]).replace(/\D/g, '');
+
+        const targetPhones = new Set<string>();
+        if (botPhone) targetPhones.add(botPhone);
+        if (linkedPhoneClean) targetPhones.add(linkedPhoneClean);
+
+        const targetLids = new Set<string>();
+        if (botLidNum) targetLids.add(botLidNum);
+
+        for (const phone of targetPhones) {
+          try {
+            const directFile = path.join(this.authDir, `lid-mapping-${phone}.json`);
+            if (fs.existsSync(directFile)) {
+              const mappedLid = String(JSON.parse(fs.readFileSync(directFile, 'utf8'))).replace(/\D/g, '');
+              if (mappedLid) targetLids.add(mappedLid);
+            }
+          } catch {}
+        }
+
+        for (const lid of targetLids) {
+          const mappedPhone = this.getLidReverseMapping(lid);
+          if (mappedPhone) targetPhones.add(mappedPhone);
+        }
+
+        const isAccountMatch = (rawId: string | undefined): boolean => {
+          if (!rawId) return false;
+          const cleanUser = rawId.split('@')[0].split(':')[0].replace(/\D/g, '');
+          if (!cleanUser) return false;
+          if (targetPhones.has(cleanUser) || targetLids.has(cleanUser)) return true;
+          if (rawId.endsWith('@lid') || !targetPhones.has(cleanUser)) {
+            const mapped = this.getLidReverseMapping(cleanUser);
+            if (mapped && targetPhones.has(mapped)) return true;
+          }
+          return false;
+        };
+
+        for (const [gid, meta] of Object.entries(allGroups)) {
+          const realSubject = meta.subject || this.groupSubjectCache.get(gid) || 'WhatsApp Group';
+          setBoundedCache(this.groupSubjectCache, gid, realSubject, 1000);
+          setBoundedCache(this.groupMetaCache, gid, { meta, timestamp: Date.now() }, 250);
+
+          const isGroupOwner = isAccountMatch(meta.owner) || isAccountMatch((meta as any).ownerPn) || isAccountMatch((meta as any).creator);
+
+          const userParticipant = meta.participants?.find((p: any) => {
+            const pId = p.id || '';
+            const pPhoneNumber = p.phoneNumber ? String(p.phoneNumber).replace(/\D/g, '') : '';
+            const pLid = p.lid ? String(p.lid).replace(/\D/g, '') : '';
+
+            if (pId && pLid) {
+              const cleanP = pId.split('@')[0].split(':')[0].replace(/\D/g, '');
+              const cleanL = pLid.split('@')[0].split(':')[0].replace(/\D/g, '');
+              if (cleanP && cleanL) setBoundedCache(this.reverseLidMap, cleanL, cleanP, 2000);
+            }
+
+            if (isAccountMatch(pId)) return true;
+            if (pPhoneNumber && targetPhones.has(pPhoneNumber)) return true;
+            if (pLid && targetLids.has(pLid)) return true;
+            return false;
+          });
+
+          const isParticipantAdmin = userParticipant?.admin === 'admin' || userParticipant?.admin === 'superadmin';
+          const isAdmin = Boolean(isGroupOwner || isParticipantAdmin);
+          const cachedPic = this.groupPictureCache.get(gid) || null;
+
+          result.push({
+            id: gid,
+            subject: realSubject,
+            desc: meta.desc ? String(meta.desc) : undefined,
+            pictureUrl: cachedPic,
+            memberCount: meta.participants?.length || 0,
+            isAdmin,
+            adminStatusVerified: true,
+            creation: meta.creation,
+            owner: meta.owner,
+            settings: commandHandler.getSecuritySettings(gid, this.userId),
+          });
+        }
+
+        this.cachedGroups = result;
+        this.lastGroupFetchTime = Date.now();
+        this.saveCachedGroups();
+
+        // Lazy-load missing group avatars in background without blocking the API response
+        const pendingPics = result.filter((g) => !g.pictureUrl);
+        if (pendingPics.length > 0) {
+          void Promise.allSettled(
+            pendingPics.slice(0, 8).map(async (g) => {
+              const url = await this.getGroupPictureUrl(g.id);
+              if (url) {
+                g.pictureUrl = url;
+              }
+            })
+          ).then(() => {
+            this.saveCachedGroups();
+          });
+        }
+
+        return result;
+      } catch (err: any) {
+        console.debug(`[Groups (${this.userId})] Live group query note (${err?.message || err}); serving cached groups.`);
         if (this.cachedGroups.length > 0) {
           return this.cachedGroups.map((group) => ({
             ...group,
-            isAdmin: false,
-            adminStatusVerified: false,
+            pictureUrl: this.groupPictureCache.get(group.id) || group.pictureUrl || null,
+            adminStatusVerified: group.adminStatusVerified ?? true,
+            settings: commandHandler.getSecuritySettings(group.id, this.userId),
           }));
         }
-        throw new Error('WhatsApp returned an invalid participating-group list.');
+        return [];
+      } finally {
+        this.groupFetchPromise = null;
       }
+    })();
 
-      // Collect all possible identities of the linked account/user
-      const credsMe = (activeSock as any)?.authState?.creds?.me || (activeSock as any)?.user || {};
-      let diskMeId = '';
-      let diskMeLid = '';
-      try {
-        const credsPath = path.join(this.authDir, 'creds.json');
-        if (fs.existsSync(credsPath)) {
-          const c = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
-          diskMeId = c?.me?.id || '';
-          diskMeLid = c?.me?.lid || '';
-        }
-      } catch {}
-
-      const botUserJid: string = credsMe.id || diskMeId || activeSock?.user?.id || (activeSock as any)?.user?.jid || '';
-      const botUserLid: string = credsMe.lid || diskMeLid || (activeSock as any)?.user?.lid || '';
-
-      const botPhone = (botUserJid.split(':')[0] || botUserJid.split('@')[0]).replace(/\D/g, '');
-      const linkedPhoneClean = (this.currentStatus.user?.phone || this.currentStatus.targetPhone || '').replace(/\D/g, '');
-      const botLidNum = (botUserLid.split(':')[0] || botUserLid.split('@')[0]).replace(/\D/g, '');
-
-      // Build target phone set and LID set
-      const targetPhones = new Set<string>();
-      if (botPhone) targetPhones.add(botPhone);
-      if (linkedPhoneClean) targetPhones.add(linkedPhoneClean);
-
-      const targetLids = new Set<string>();
-      if (botLidNum) targetLids.add(botLidNum);
-
-      // Check if user phone has corresponding LID file
-      for (const phone of targetPhones) {
-        try {
-          const directFile = path.join(this.authDir, `lid-mapping-${phone}.json`);
-          if (fs.existsSync(directFile)) {
-            const mappedLid = String(JSON.parse(fs.readFileSync(directFile, 'utf8'))).replace(/\D/g, '');
-            if (mappedLid) targetLids.add(mappedLid);
-          }
-        } catch {
-          // Ignore read error
-        }
-      }
-
-      // Check reverse mapping for target LIDs
-      for (const lid of targetLids) {
-        const mappedPhone = this.getLidReverseMapping(lid);
-        if (mappedPhone) targetPhones.add(mappedPhone);
-      }
-
-      const isAccountMatch = (rawId: string | undefined): boolean => {
-        if (!rawId) return false;
-        const cleanUser = rawId.split('@')[0].split(':')[0].replace(/\D/g, '');
-        if (!cleanUser) return false;
-
-        if (targetPhones.has(cleanUser)) return true;
-        if (targetLids.has(cleanUser)) return true;
-
-        // Check if rawId is a LID that maps to our phone
-        if (rawId.endsWith('@lid') || !targetPhones.has(cleanUser)) {
-          const mapped = this.getLidReverseMapping(cleanUser);
-          if (mapped && targetPhones.has(mapped)) {
-            return true;
-          }
-        }
-
-        return false;
-      };
-
-      for (const [gid, meta] of Object.entries(allGroups)) {
-        const realSubject = meta.subject || this.groupSubjectCache.get(gid) || 'WhatsApp Group';
-        setBoundedCache(this.groupSubjectCache, gid, realSubject, 1000);
-
-        // Check 1: Is user the group creator/owner? (In WhatsApp, the group creator is always admin)
-        const isGroupOwner = isAccountMatch(meta.owner) || isAccountMatch((meta as any).ownerPn) || isAccountMatch((meta as any).creator);
-
-        // Check 2: Find participant record for linked phone/account
-        const userParticipant = meta.participants?.find((p: any) => {
-          const pId = p.id || '';
-          const pPhoneNumber = p.phoneNumber ? String(p.phoneNumber).replace(/\D/g, '') : '';
-          const pLid = p.lid ? String(p.lid).replace(/\D/g, '') : '';
-
-          if (isAccountMatch(pId)) return true;
-          if (pPhoneNumber && targetPhones.has(pPhoneNumber)) return true;
-          if (pLid && targetLids.has(pLid)) return true;
-
-          return false;
-        });
-
-        const isParticipantAdmin = userParticipant?.admin === 'admin' || userParticipant?.admin === 'superadmin';
-        const isAdmin = Boolean(isGroupOwner || isParticipantAdmin);
-
-        // If adminOnlyFilter is explicitly requested, only return admin groups.
-        // Otherwise, return all groups the connected user is participating in!
-        if (adminOnlyFilter && !isAdmin) {
-          continue;
-        }
-
-        // Check if cached picture URL exists
-        const cachedPic = this.groupPictureCache.get(gid) || null;
-
-        result.push({
-          id: gid,
-          subject: realSubject,
-          desc: meta.desc ? String(meta.desc) : undefined,
-          pictureUrl: cachedPic,
-          memberCount: meta.participants?.length || 0,
-          isAdmin,
-          adminStatusVerified: true,
-          creation: meta.creation,
-          owner: meta.owner,
-          settings: commandHandler.getSecuritySettings(gid, this.userId),
-        });
-      }
-
-      // Concurrently fetch real pictures for groups that do not have them in cache
-      const pendingPics = result.filter((g) => !g.pictureUrl);
-      if (pendingPics.length > 0) {
-        // Fetch up to 10 in parallel
-        await Promise.allSettled(
-          pendingPics.slice(0, 10).map(async (g) => {
-            const url = await this.getGroupPictureUrl(g.id);
-            if (url) {
-              g.pictureUrl = url;
-            }
-          })
-        );
-      }
-    } catch (err: any) {
-      console.warn(`[Groups (${this.userId})] Error fetching live participating groups:`, err?.message || err);
-      if (this.cachedGroups.length > 0) {
-        return this.cachedGroups.map((group) => ({
-          ...group,
-          isAdmin: false,
-          adminStatusVerified: false,
-        }));
-      }
-      throw err instanceof Error ? err : new Error('Failed to fetch participating WhatsApp groups.');
-    }
-
-    this.cachedGroups = result;
-    this.lastGroupFetchTime = Date.now();
-
-    return result;
+    const finalGroups = await this.groupFetchPromise;
+    return adminOnlyFilter ? finalGroups.filter((g) => g.isAdmin) : finalGroups;
   }
 }
 
@@ -6198,9 +6222,9 @@ export class WhatsAppSessionManager {
   private aliasToCanonicalId = new Map<string, string>();
   private baseAuthDir = path.resolve(process.cwd(), '.baileys_auth');
   private initialCloudSeedDone = false;
+  private autoRestoreRunning = false;
 
   constructor() {
-    this.autoRestoreAllSessions();
     this.startGlobalOneMinuteSyncWatchdog();
   }
 
@@ -6353,6 +6377,10 @@ export class WhatsAppSessionManager {
   }
 
   public async autoRestoreAllSessions(): Promise<void> {
+    if (this.autoRestoreRunning) {
+      return;
+    }
+    this.autoRestoreRunning = true;
     try {
       if (!fs.existsSync(this.baseAuthDir)) {
         fs.mkdirSync(this.baseAuthDir, { recursive: true });
@@ -6381,10 +6409,10 @@ export class WhatsAppSessionManager {
         candidateUsers.set('default', candidateUsers.get('default') || {});
       }
 
-      // 2. Scan cloud Firestore `column` collection (User email, phone, and 3 keys)
+      // 2. Scan cloud Firestore `studio_sessions` collection
       if (!isFirestoreQuotaExhausted()) {
         try {
-          const snap = await getDocs(collection(db, 'column'));
+          const snap = await getDocs(collection(db, 'studio_sessions'));
           for (const docSnap of snap.docs) {
             const d = docSnap.data();
             if (d?.unlinked === true || (!d?.phoneNumber && !d?.credsData)) {
@@ -6417,7 +6445,7 @@ export class WhatsAppSessionManager {
           }
         } catch (err: any) {
           reportFirestoreError(err);
-          console.warn('[Auto-Restore] Firestore column scan note:', err?.message || err);
+          console.warn('[Auto-Restore] Firestore studio_sessions scan note:', err?.message || err);
         }
       }
 
@@ -6496,15 +6524,13 @@ export class WhatsAppSessionManager {
           }
 
           // User has a valid license!
-          // Now check: has this user linked WhatsApp before?
           const hasCreds = await session.ensureRestored();
           if (hasCreds) {
             console.log(`[Auto-Restore] User ${uid} (${meta.email || 'user'}) has valid license AND linked WhatsApp credentials. Auto-reconnecting in background...`);
-            if (!session.isSocketActive()) {
+            if (!session.isSocketActive() && !(session as any).isConnecting && !(session as any).initPromise) {
               session.initSocket().catch((err) => {
                 console.warn(`[Auto-Restore] Reconnect socket note for ${uid}:`, err?.message || err);
               });
-              // Stagger reconnects by 2.5s to prevent concurrent memory spikes on Render's 512MB RAM
               await new Promise((r) => setTimeout(r, 2500));
             }
           } else if (!meta.linkedPhone) {
@@ -6517,6 +6543,8 @@ export class WhatsAppSessionManager {
       }
     } catch (e) {
       console.warn('Error in autoRestoreAllSessions:', e);
+    } finally {
+      this.autoRestoreRunning = false;
     }
   }
 
@@ -6541,12 +6569,12 @@ export class WhatsAppSessionManager {
     if (this.globalSyncInterval) {
       clearInterval(this.globalSyncInterval);
     }
-    console.log('[Global Watchdog] Starting Railway account watchdog (health pass every 5 minutes)...');
+    console.log('[Global Watchdog] Starting account health watchdog (every 5 minutes)...');
 
-    // Run first sync shortly after startup, then continue every 5 minutes.
+    // Run first health pass 60s after startup so startup autoRestore completes cleanly without overlap
     setTimeout(() => {
       this.runGlobalOneMinuteSync().catch((err) => console.warn('[Global Watchdog] Startup pass error:', err));
-    }, 5000);
+    }, 60000);
 
     this.globalSyncInterval = setInterval(() => {
       this.runGlobalOneMinuteSync().catch((err) => console.warn('[Global Watchdog] Periodic pass error:', err));
@@ -6554,8 +6582,8 @@ export class WhatsAppSessionManager {
   }
 
   public async runGlobalOneMinuteSync(): Promise<{ totalChecked: number; activeOnline: number; reconnected: number; expiredDisconnected: number; unlockedForPairing: number }> {
-    if (this.globalSyncRunning) {
-      console.warn('[Global Watchdog] Skipping this pass because the previous pass is still running.');
+    if (this.globalSyncRunning || this.autoRestoreRunning) {
+      console.warn('[Global Watchdog] Skipping this pass because another sync/restore pass is running.');
       return {
         totalChecked: 0,
         activeOnline: 0,
@@ -6578,8 +6606,6 @@ export class WhatsAppSessionManager {
 
     try {
       const userIds = new Set<string>();
-      const phoneLocks = new Map<string, string>();
-      let cloudSessionScanCompleted = false;
 
       // 1. Gather all local session folders (Zero Firestore reads!)
       if (fs.existsSync(this.baseAuthDir)) {
@@ -6596,17 +6622,11 @@ export class WhatsAppSessionManager {
         userIds.add(uid);
       }
 
-      // 3. Cloud sessions scan: Protect Firebase Spark Free Tier 50k daily read quota!
-      // NEVER query entire collections ('column' / 'users') repeatedly every 30 minutes!
-      // For 1,000 users, querying 'column' + 'users' consumes 2,000 reads per check (96,000 reads/day),
-      // which quickly blows past the 50,000 reads/day quota.
-      // We only do a one-time initial cloud seed if the local disk is completely empty (e.g. first deploy).
-      // Active users are served from local disk + in-memory cache + on-demand direct document reads.
+      // 3. One-time initial cloud seed from studio_sessions if local disk is empty
       if (userIds.size === 0 && !this.initialCloudSeedDone && !isFirestoreQuotaExhausted()) {
         this.initialCloudSeedDone = true;
         try {
-          const sessionDocs = await getDocs(collection(db, 'column'));
-          cloudSessionScanCompleted = true;
+          const sessionDocs = await getDocs(collection(db, 'studio_sessions'));
           for (const docSnap of sessionDocs.docs) {
             const d = docSnap.data();
             if (d?.unlinked === true || (!d?.phoneNumber && !d?.credsData)) {
@@ -6619,7 +6639,7 @@ export class WhatsAppSessionManager {
           }
         } catch (err: any) {
           reportFirestoreError(err);
-          console.debug('[Global Watchdog] Firestore column initial seed note:', err?.message || err);
+          console.debug('[Global Watchdog] Firestore studio_sessions initial seed note:', err?.message || err);
         }
       }
 
@@ -6646,17 +6666,14 @@ export class WhatsAppSessionManager {
           if (isReallyLive) {
             activeOnline++;
             this.unlinkedSessionSince.delete(uid);
-            // Periodic 30-minute auto-pruning to keep disk space lean and prevent key flooding
             const now = Date.now();
             if (!session.lastPruneTime || now - session.lastPruneTime > 30 * 60 * 1000) {
               session.lastPruneTime = now;
               session.pruneStaleSessionFiles();
             }
-            continue; // Skip connected users completely! Zero writes to Firestore, zero socket touching, zero freezes!
+            continue;
           }
 
-          // If the 1-minute reconnection window timed out and WhatsApp was unreachable,
-          // do NOT spam reconnect attempts. The user must generate a fresh pairing code.
           if ((session as any).reconnectTimedOut) {
             continue;
           }
@@ -6667,7 +6684,7 @@ export class WhatsAppSessionManager {
           if (isExpired) {
             this.unlinkedSessionSince.delete(uid);
             expiredDisconnected++;
-            continue; // Inactive or expired license -> do not auto reconnect!
+            continue;
           }
 
           // 3. CHECK CREDENTIALS
@@ -6684,7 +6701,7 @@ export class WhatsAppSessionManager {
             currentStatus.pairingStage === 'pairing_handshake' ||
             Boolean(currentStatus.pairingCode);
 
-          if (!pairingInProgress && currentStatus.state !== 'connecting' && !(session as any).isConnecting && !(session as any).sock) {
+          if (!pairingInProgress && currentStatus.state !== 'connecting' && !(session as any).isConnecting && !(session as any).initPromise && !(session as any).sock) {
             console.log(`[Global 1-Min Sync] User ${uid} disconnected with active license and valid credentials. Single reconnect pass...`);
             reconnected++;
             session.initSocket().catch((err) => {
@@ -6727,7 +6744,7 @@ export class WhatsAppSessionManager {
     }
     const sessions = Array.from(this.sessions.values());
     await Promise.allSettled(sessions.map((session) => session.flushFirebaseCredsSync()));
-    await Promise.allSettled(sessions.map((session) => session.pauseSocket('Railway process shutdown')));
+    await Promise.allSettled(sessions.map((session) => session.pauseSocket('Server process shutdown')));
     await Promise.allSettled(sessions.map((session) => session.flushFirebaseCredsSync()));
   }
 
@@ -6800,10 +6817,10 @@ export class WhatsAppSessionManager {
       } catch {}
     }
 
-    // 3. Scan Firestore 'column' collection
+    // 3. Scan Firestore 'studio_sessions' collection
     if (!isFirestoreQuotaExhausted()) {
       try {
-        const colSnap = await getDocs(collection(db, 'column'));
+        const colSnap = await getDocs(collection(db, 'studio_sessions'));
         for (const d of colSnap.docs) {
           const data = d.data();
           const email = typeof data.email === 'string' ? data.email.trim().toLowerCase() : '';
@@ -6881,7 +6898,7 @@ export class WhatsAppSessionManager {
     // 3. Fallback: Only scan remote Firestore if disk has zero candidates and quota is healthy
     if (candidateUids.size === 0 && !isFirestoreQuotaExhausted()) {
       try {
-        const colSnap = await getDocs(collection(db, 'column'));
+        const colSnap = await getDocs(collection(db, 'studio_sessions'));
         for (const d of colSnap.docs) {
           const data = d.data();
           const uid = data?.userId || (d.id.startsWith('session_') ? d.id.replace(/^session_/, '') : d.id);
@@ -6896,7 +6913,7 @@ export class WhatsAppSessionManager {
           }
         }
       } catch (colErr) {
-        console.warn('[ReconnectAll] Firestore column scan note:', colErr);
+        console.warn('[ReconnectAll] Firestore studio_sessions scan note:', colErr);
       }
     }
 

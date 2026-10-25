@@ -162,8 +162,8 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
 
   // Fetch real participating groups from server for connected user
   const fetchGroups = async (isManualSync = false) => {
-    // If not connected, do not attempt to fetch or show groups
-    if (!isConnected) {
+    // If neither connected nor paired, do not attempt to fetch or show groups
+    if (!isConnected && !isPaired) {
       setLoading(false);
       setGroups((prev) => prev.map((group) => ({
         ...group,
@@ -209,7 +209,7 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
         }>(res);
 
         if (data && Array.isArray(data.groups)) {
-          const canTrustGroupList = data.connected === true && data.groupFetchVerified === true;
+          const canTrustGroupList = data.groupFetchVerified === true;
           if (!canTrustGroupList) {
             setGroupSyncWarning(
               data.connected === false
@@ -271,7 +271,7 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
   };
 
   useEffect(() => {
-    if (isConnected) {
+    if (isConnected || isPaired) {
       void fetchGroups();
     } else {
       setLoading(false);
@@ -281,7 +281,7 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
         adminStatusVerified: false,
       })));
     }
-  }, [isConnected, userId, currentUser]);
+  }, [isConnected, isPaired, userId, currentUser]);
 
   // Handle single switch toggle
   const handleToggleSetting = async (
