@@ -1428,7 +1428,6 @@ Message successfully pinned for 7 days by Group Admin!
       output += `│ 3. @2347098765432\n`;
       output += `╰───────────────────────────────╯\n\n`;
       output += `> ⚡ *SOLVATECH BOT BROADCAST*`;
-
       return { reply: output };
     }
 
@@ -1450,7 +1449,36 @@ Message successfully pinned for 7 days by Group Admin!
       output += `│ 3. @2347098765432\n`;
       output += `╰───────────────────────────────╯\n\n`;
       output += `> ⚡ *SOLVATECH BOT ADMIN ALERT*`;
-      return { reply: output };
+      const groupMeta = ctx.groupJid
+        ? await ctx.getCachedGroupMetadata?.(ctx.groupJid)
+        : null;
+      if (!groupMeta || !Array.isArray(groupMeta.participants)) {
+        return {
+          reply: '⚠️ WhatsApp could not verify this group’s current admin list. No admin status is being reported.',
+        };
+      }
+      const admins = groupMeta.participants.filter(
+        (participant: any) => participant.admin === 'admin' || participant.admin === 'superadmin'
+      );
+      const mentions = admins
+        .map((admin: any) => admin.id || admin.phoneNumber || admin.lid)
+        .filter((jid: unknown): jid is string => typeof jid === 'string');
+      const adminLines = admins.map((admin: any, index: number) => {
+        const jid = admin.id || admin.phoneNumber || admin.lid;
+        const number = typeof jid === 'string'
+          ? jid.split('@')[0].split(':')[0].replace(/\D/g, '')
+          : 'WhatsApp user';
+        return `│ ${index + 1}. @${number || 'WhatsApp user'}${admin.admin === 'superadmin' ? ' 👑 (WhatsApp superadmin)' : ''}`;
+      });
+      output = `╭━━━〔 🛡️ *VERIFIED ADMINISTRATOR ROSTER* 〕━━━╮\n` +
+        `┃ 👥 *Group:* *${groupMeta.subject || 'WhatsApp Group'}*\n` +
+        `┃ 🛡️ *Total Admins:* *${admins.length}*\n` +
+        (customReason ? `┃ ⚠️ *Notice:* *${customReason}*\n` : '') +
+        `╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n\n` +
+        `╭──〔 ⚡ *WHATSAPP ADMINISTRATORS* 〕──╮\n` +
+        `${adminLines.length ? `${adminLines.join('\n')}\n` : '│ No administrators were returned by WhatsApp.\n'}` +
+        `╰───────────────────────────────╯\n\n> ⚡ *SOLVATECH BOT ADMIN ALERT*`;
+      return { reply: output, metadata: { mentions } };
     }
 
     if (cmd === 'kick' || cmd === 'remove') {
@@ -1480,7 +1508,7 @@ Message successfully pinned for 7 days by Group Admin!
       }
       const target = (ctx.args[0] || '@user').replace(/\D/g, '') || '2348012345678';
       return {
-        reply: `⭐ *[ADMIN PROMOTED]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🎉 *Congratulations:* @${target}\n🛡️ Promoted to *Group Administrator*!\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n> ⚡ _SOLVATECH Group Administration_`,
+        reply: '⚠️ Promotion was not executed by this preview. Use the live WhatsApp group command; success is reported only after WhatsApp confirms the new admin role.',
       };
     }
 
@@ -1490,7 +1518,7 @@ Message successfully pinned for 7 days by Group Admin!
       }
       const target = (ctx.args[0] || '@user').replace(/\D/g, '') || '2348012345678';
       return {
-        reply: `🔻 *[ADMIN DEMOTED]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n👤 *Participant:* @${target}\n⚠️ Demoted from Administrator back to regular member.\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n> ⚡ _SOLVATECH Group Administration_`,
+        reply: '⚠️ Demotion was not executed by this preview. Use the live WhatsApp group command; success is reported only after WhatsApp confirms the updated role.',
       };
     }
 

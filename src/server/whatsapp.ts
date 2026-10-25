@@ -5992,6 +5992,7 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
       pictureUrl?: string | null;
       memberCount: number;
       isAdmin: boolean;
+      adminStatusVerified?: boolean;
       creation?: number;
       owner?: string;
       settings: any;
