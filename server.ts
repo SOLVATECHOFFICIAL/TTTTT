@@ -99,7 +99,7 @@ async function startServer() {
     process.env.NODE_ENV === 'production'
   );
   const requestedPort = Number.parseInt(process.env.PORT || '', 10);
-  const defaultPort = isCloudHost ? 3000 : 5000;
+  const defaultPort = 3000;
   const PORT = Number.isInteger(requestedPort) && requestedPort > 0 ? requestedPort : defaultPort;
   const isProd = process.env.NODE_ENV === 'production';
 
