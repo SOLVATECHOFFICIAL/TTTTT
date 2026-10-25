@@ -1244,7 +1244,8 @@ async function startServer() {
       }
       const adminOnly = req.query.adminOnly === 'true' || req.query.adminOnly === '1';
       const groups = await session.getGroupsWithSettings(adminOnly);
-      return res.json({ success: true, connected: isLive, groups });
+      const groupFetchVerified = isLive && groups.every((group) => group.adminStatusVerified === true);
+      return res.json({ success: true, connected: isLive, groupFetchVerified, groups });
     } catch (err: any) {
       console.error('Error fetching groups:', err);
       res.status(500).json({ success: false, error: err.message, groups: [] });
@@ -1274,7 +1275,8 @@ async function startServer() {
       }
       const adminOnly = req.body?.adminOnly === true || req.query.adminOnly === 'true';
       const groups = await session.getGroupsWithSettings(adminOnly);
-      return res.json({ success: true, connected: isLive, groups });
+      const groupFetchVerified = isLive && groups.every((group) => group.adminStatusVerified === true);
+      return res.json({ success: true, connected: isLive, groupFetchVerified, groups });
     } catch (err: any) {
       console.error('Error syncing groups:', err);
       res.status(500).json({ success: false, error: err.message, groups: [] });

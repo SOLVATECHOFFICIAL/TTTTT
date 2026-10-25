@@ -87,7 +87,7 @@ const GroupAvatar: React.FC<{
           cache: 'no-store',
         });
       })()
-        .then((res) => (res.ok ? res.json() : null))
+        .then((res) => (res?.ok ? res.json() : null))
         .then((data) => {
           if (isMounted && data?.pictureUrl) {
             setImgUrl(data.pictureUrl);
@@ -126,7 +126,7 @@ const GroupAvatar: React.FC<{
           <span className="text-[9px] uppercase tracking-tighter opacity-80 font-bold">Group</span>
         </div>
       )}
-      {group.adminStatusVerified !== false && group.isAdmin && (
+      {group.adminStatusVerified === true && group.isAdmin && (
         <span
           className="absolute bottom-0 right-0 p-1 bg-amber-500 text-slate-950 rounded-tl-lg shadow-sm"
           title="Admin in this group"
@@ -165,7 +165,11 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
     // If not connected, do not attempt to fetch or show groups
     if (!isConnected) {
       setLoading(false);
-      setGroups((prev) => prev.map((group) => ({ ...group, adminStatusVerified: false })));
+      setGroups((prev) => prev.map((group) => ({
+        ...group,
+        isAdmin: false,
+        adminStatusVerified: false,
+      })));
       return;
     }
     if (groupsRequestInFlight.current) return;
@@ -200,36 +204,49 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
         const data = await safeParseJson<{
           success: boolean;
           connected?: boolean;
+          groupFetchVerified?: boolean;
           groups?: GroupItem[];
         }>(res);
 
         if (data && Array.isArray(data.groups)) {
-          if (data.connected === false) {
+          const canTrustGroupList = data.connected === true && data.groupFetchVerified === true;
+          if (!canTrustGroupList) {
             setGroupSyncWarning(
-              'WhatsApp is reconnecting. The last group list is shown as unverified; admin controls are disabled until roles are checked again.'
+              data.connected === false
+                ? 'WhatsApp is reconnecting. The last group list is shown as unverified; admin controls are disabled until roles are checked again.'
+                : 'WhatsApp could not verify the current group list. Any displayed cached groups are marked unverified and cannot be changed.'
             );
-            setGroups((prev) => prev.map((group) => ({ ...group, adminStatusVerified: false })));
-          } else if (!isManualSync && data.groups.length === 0 && groups.length > 0) {
-            setGroupSyncWarning(
-              'This background check returned no groups. Your last confirmed groups are still shown; use Sync & Detect Groups to verify them.'
-            );
+            if (data.groups.length > 0) {
+              setGroups(data.groups.map((group) => ({
+                ...group,
+                isAdmin: false,
+                adminStatusVerified: false,
+              })));
+            } else {
+              setGroups((prev) => prev.map((group) => ({
+                ...group,
+                isAdmin: false,
+                adminStatusVerified: false,
+              })));
+            }
           } else {
             setGroups(data.groups.map((group) => ({
               ...group,
-              adminStatusVerified: group.adminStatusVerified !== false,
+              adminStatusVerified: group.adminStatusVerified === true,
             })));
             setGroupSyncWarning(null);
           }
 
           if (isManualSync) {
             const adminCount = data.groups.filter(
-              (group) => group.adminStatusVerified !== false && group.isAdmin
+              (group) => canTrustGroupList && group.adminStatusVerified === true && group.isAdmin
             ).length;
+            const groupListVerified = canTrustGroupList && data.groups.every((group) => group.adminStatusVerified === true);
             onShowToast?.({
               id: 'group_sync_' + Date.now(),
-              type: data.connected === false ? 'warning' : 'system',
-              title: data.connected === false ? 'WhatsApp is reconnecting' : 'Groups Synchronized 🔄',
-              body: data.connected === false
+              type: groupListVerified ? 'system' : 'warning',
+              title: groupListVerified ? 'Groups Synchronized 🔄' : 'WhatsApp is reconnecting',
+              body: !groupListVerified
                 ? 'Group membership and admin roles were not verified. Retry after the socket reconnects.'
                 : `Found ${data.groups.length} participating WhatsApp groups (${adminCount} verified admin).`,
               timestamp: new Date().toLocaleTimeString(),
@@ -258,6 +275,11 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
       void fetchGroups();
     } else {
       setLoading(false);
+      setGroups((prev) => prev.map((group) => ({
+        ...group,
+        isAdmin: false,
+        adminStatusVerified: false,
+      })));
     }
   }, [isConnected, userId, currentUser]);
 
@@ -268,7 +290,7 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
     currentValue: boolean
   ) => {
     const targetGroup = groups.find((g) => g.id === groupId);
-    if (targetGroup && !targetGroup.isAdmin) {
+    if (targetGroup && (!targetGroup.adminStatusVerified || !targetGroup.isAdmin)) {
       onShowToast?.({
         id: 'admin_req_' + Date.now(),
         type: 'warning',
@@ -300,9 +322,14 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
     );
 
     try {
-      const res = await fetch('/api/groups/settings', {
+      if (!currentUser || !userId) throw new Error('Sign in again to verify your group access.');
+      const token = await currentUser.getIdToken();
+      const res = await fetch(`/api/groups/settings?userId=${encodeURIComponent(userId)}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
         body: JSON.stringify({ groupId, key, value: nextVal, userId }),
       });
 
@@ -323,6 +350,14 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
           timestamp: new Date().toLocaleTimeString(),
         });
       } else {
+        const errorData = await safeParseJson<{ error?: string }>(res);
+        onShowToast?.({
+          id: `setting_error_${Date.now()}`,
+          type: 'error',
+          title: 'Protection setting was not changed',
+          body: errorData?.error || 'WhatsApp rejected this setting change.',
+          timestamp: new Date().toLocaleTimeString(),
+        });
         // Revert on failure
         setGroups((prev) =>
           prev.map((g) => {
@@ -341,6 +376,13 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
       }
     } catch (err) {
       console.error('Error toggling group setting:', err);
+      onShowToast?.({
+        id: `setting_error_${Date.now()}`,
+        type: 'error',
+        title: 'Protection setting was not changed',
+        body: err instanceof Error ? err.message : 'Verify the WhatsApp admin role and try again.',
+        timestamp: new Date().toLocaleTimeString(),
+      });
       // Revert on network error
       setGroups((prev) =>
         prev.map((g) => {
@@ -364,7 +406,7 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
   // Turn ALL anti-features & welcome ON or OFF for a group
   const handleToggleAllForGroup = async (groupId: string, enableAll: boolean) => {
     const targetGroup = groups.find((g) => g.id === groupId);
-    if (targetGroup && !targetGroup.isAdmin) {
+    if (targetGroup && (!targetGroup.adminStatusVerified || !targetGroup.isAdmin)) {
       onShowToast?.({
         id: 'admin_req_' + Date.now(),
         type: 'warning',
@@ -375,6 +417,7 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
       return;
     }
 
+    const previousSettings = targetGroup?.settings;
     // Optimistic update
     setGroups((prev) =>
       prev.map((g) => {
@@ -397,9 +440,14 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
     );
 
     try {
-      const res = await fetch('/api/groups/toggle-all', {
+      if (!currentUser || !userId) throw new Error('Sign in again to verify your group access.');
+      const token = await currentUser.getIdToken();
+      const res = await fetch(`/api/groups/toggle-all?userId=${encodeURIComponent(userId)}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
         body: JSON.stringify({ groupId, enableAll, userId }),
       });
 
@@ -411,16 +459,32 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
           body: `All auto-greetings & anti switches for group synced to ${enableAll ? 'ACTIVE' : 'DISABLED'}.`,
           timestamp: new Date().toLocaleTimeString(),
         });
+      } else {
+        const errorData = await safeParseJson<{ error?: string }>(res);
+        throw new Error(errorData?.error || 'WhatsApp rejected this settings change.');
       }
     } catch (err) {
       console.error('Error toggling all group settings:', err);
+      if (previousSettings) {
+        setGroups((prev) => prev.map((group) => group.id === groupId
+          ? { ...group, settings: previousSettings }
+          : group
+        ));
+      }
+      onShowToast?.({
+        id: `toggle_all_error_${Date.now()}`,
+        type: 'error',
+        title: 'Protection settings were not changed',
+        body: err instanceof Error ? err.message : 'Verify the WhatsApp admin role and try again.',
+        timestamp: new Date().toLocaleTimeString(),
+      });
     }
   };
 
   // Change warning limit for a group
   const handleChangeWarnLimit = async (groupId: string, limit: number) => {
     const targetGroup = groups.find((g) => g.id === groupId);
-    if (targetGroup && !targetGroup.isAdmin) {
+    if (targetGroup && (!targetGroup.adminStatusVerified || !targetGroup.isAdmin)) {
       onShowToast?.({
         id: 'admin_req_' + Date.now(),
         type: 'warning',
@@ -431,6 +495,7 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
       return;
     }
 
+    const previousWarnLimit = targetGroup?.settings.warnLimit;
     // Optimistic update
     setGroups((prev) =>
       prev.map((g) => {
@@ -448,11 +513,20 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
     );
 
     try {
-      await fetch('/api/groups/warn-limit', {
+      if (!currentUser || !userId) throw new Error('Sign in again to verify your group access.');
+      const token = await currentUser.getIdToken();
+      const response = await fetch(`/api/groups/warn-limit?userId=${encodeURIComponent(userId)}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
         body: JSON.stringify({ groupId, limit, userId }),
       });
+      if (!response.ok) {
+        const errorData = await safeParseJson<{ error?: string }>(response);
+        throw new Error(errorData?.error || 'WhatsApp rejected this warning-limit change.');
+      }
       onShowToast?.({
         id: 'warn_limit_' + Date.now(),
         type: 'system',
@@ -462,6 +536,19 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
       });
     } catch (err) {
       console.error('Error setting warn limit:', err);
+      if (previousWarnLimit !== undefined) {
+        setGroups((prev) => prev.map((group) => group.id === groupId
+          ? { ...group, settings: { ...group.settings, warnLimit: previousWarnLimit } }
+          : group
+        ));
+      }
+      onShowToast?.({
+        id: `warn_limit_error_${Date.now()}`,
+        type: 'error',
+        title: 'Warning limit was not changed',
+        body: err instanceof Error ? err.message : 'Verify the WhatsApp admin role and try again.',
+        timestamp: new Date().toLocaleTimeString(),
+      });
     }
   };
 
@@ -561,14 +648,20 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
     }
   };
 
-  const adminCount = useMemo(() => groups.filter((g) => g.isAdmin).length, [groups]);
-  const memberCount = useMemo(() => groups.filter((g) => !g.isAdmin).length, [groups]);
+  const adminCount = useMemo(
+    () => groups.filter((g) => g.adminStatusVerified === true && g.isAdmin).length,
+    [groups],
+  );
+  const memberCount = useMemo(
+    () => groups.filter((g) => g.adminStatusVerified === true && !g.isAdmin).length,
+    [groups],
+  );
 
   // Filter groups — by selected filter and search query
   const filteredGroups = useMemo(() => {
     return groups.filter((g) => {
-      if (groupFilter === 'admin' && !g.isAdmin) return false;
-      if (groupFilter === 'member' && g.isAdmin) return false;
+      if (groupFilter === 'admin' && !(g.adminStatusVerified === true && g.isAdmin)) return false;
+      if (groupFilter === 'member' && !(g.adminStatusVerified === true && !g.isAdmin)) return false;
       if (!searchQuery) return true;
       const q = searchQuery.toLowerCase();
       return (
@@ -890,7 +983,11 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
             aria-disabled={!isConnected}
             className={`space-y-4 ${!isConnected ? 'pointer-events-none opacity-60' : ''}`}
           >
-            {filteredGroups.map((group) => {
+            {filteredGroups.map((rawGroup) => {
+            const group: GroupItem = {
+              ...rawGroup,
+              isAdmin: rawGroup.adminStatusVerified === true && rawGroup.isAdmin,
+            };
             const sec = group.settings || {
               autowelcome: true,
               autogoodbye: true,
@@ -918,7 +1015,7 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-800/80">
                   <div className="flex items-start gap-4">
                     {/* Real Group Picture Avatar */}
-                    <GroupAvatar group={group} userId={userId} />
+                    <GroupAvatar group={group} userId={userId} currentUser={currentUser} />
 
                     <div className="space-y-1">
                       <div className="flex items-center gap-2 flex-wrap">
@@ -926,7 +1023,11 @@ export const GroupAdminPanel: React.FC<GroupAdminPanelProps> = ({
                         <h3 className="text-base sm:text-lg font-bold text-white tracking-tight">
                           {group.subject}
                         </h3>
-                        {group.isAdmin ? (
+                        {group.adminStatusVerified !== true ? (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-slate-800 text-slate-400 border border-slate-700">
+                            Admin role unverified
+                          </span>
+                        ) : group.isAdmin ? (
                           <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30 flex items-center gap-1">
                             <Crown className="w-3 h-3 fill-amber-300" />
                             <span>You are Admin</span>

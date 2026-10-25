@@ -1941,7 +1941,7 @@ export class WhatsAppManager {
       }
       return meta;
     } catch (err) {
-      if (cached) return cached.meta;
+      if (cached && !force) return cached.meta;
       throw err;
     }
   }
@@ -3324,7 +3324,7 @@ export class WhatsAppManager {
             } catch {}
           }
           // STRICT RULE: Group admin commands require the user to be BOTH a group admin AND the bot owner!
-          const isAuthorizedAdmin = isOwner && isSenderAdmin;
+          let isAuthorizedAdmin = Boolean(isOwner && isSenderAdmin);
 
           const isGroupInfoTrigger = /^\.(groupinfo|gcinfo|group)(\s|$)/i.test(text.trim());
 
@@ -3601,6 +3601,9 @@ export class WhatsAppManager {
             const args = parts.slice(1);
 
             const isGroupInfoCmd = command === 'groupinfo' || command === 'gcinfo' || command === 'group' || command === 'link';
+            console.info(
+              `[WhatsApp Command] .${command} received (${isGroup ? 'group' : 'direct'}, linked owner: ${Boolean(isOwner)}).`
+            );
             // STRICT OWNER ISOLATION: The bot strictly listens ONLY to the person who linked it!
             // If someone else types .menu, .ping, etc. in a group or DM, NEVER answer them and NEVER react!
             if (!isOwner) {
@@ -3630,12 +3633,41 @@ export class WhatsAppManager {
             // Group chats:
             // Admin moderation commands (.kick, .warn, .lock, etc.) require the bot owner to ALSO be a group admin in WhatsApp!
             if (isGroup && ADMIN_ONLY_GROUP_COMMANDS.has(command)) {
-              if (!isSenderAdmin) {
-                return; // Owner is not an admin in this group: silent ignore
+              // Re-check current WhatsApp roles for every privileged command; cached roles can go stale after a demotion.
+              const freshMeta = await this.getCachedGroupMetadata(sock, remoteJid, true);
+              const actorIds = new Set(
+                [
+                  senderNum,
+                  participantNum,
+                  mappedSenderPhone,
+                  ...(isFromMe ? [botPhone, botLidNum, linkedPhoneClean] : []),
+                ]
+                  .filter(Boolean)
+                  .map((value) => String(value).replace(/\D/g, '')),
+              );
+              const currentSender = freshMeta?.participants?.find((participant: any) =>
+                [participant.id, participant.phoneNumber, participant.lid]
+                  .filter((value: unknown): value is string => typeof value === 'string')
+                  .some((value: string) => {
+                    if (value === senderJid || value === participantRaw) return true;
+                    const clean = value.split('@')[0].split(':')[0].replace(/\D/g, '');
+                    const mapped = this.getLidReverseMapping(clean);
+                    return actorIds.has(clean) || Boolean(mapped && actorIds.has(mapped));
+                  })
+              );
+              isSenderAdmin = Boolean(
+                currentSender?.admin === 'admin' || currentSender?.admin === 'superadmin',
+              );
+              isAuthorizedAdmin = Boolean(isOwner && isSenderAdmin);
+              if (!isAuthorizedAdmin) {
+                await sock.sendMessage(remoteJid, {
+                  text: '⛔ This action requires the linked WhatsApp account to be a current group admin. No change was made.',
+                }, { quoted: msg }).catch(() => {});
+                return;
               }
 
-              // In groups: Moderation and admin group commands require the bot to be an admin in that group
-              const isBotAdmin = await this.isBotAdminInGroupById(remoteJid);
+              // Check the linked bot account's role from the same fresh WhatsApp metadata.
+              const isBotAdmin = freshMeta ? this.isBotAdminInGroup(freshMeta) : false;
               if (!isBotAdmin) {
                 await sock.sendMessage(remoteJid, {
                   text: `⚠️ *[BOT NOT ADMIN]*\nThe bot must be promoted to Group Administrator to execute group management commands.`,
@@ -4319,7 +4351,7 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
               if (!isGroup || !isAuthorizedAdmin) return;
 
               try {
-                const groupMeta = await this.getCachedGroupMetadata(sock, remoteJid);
+                const groupMeta = await this.getCachedGroupMetadata(sock, remoteJid, true);
                 let targetJid = mentionedJids[0] || quotedParticipant;
                 if (!targetJid && args[0]) {
                   const cleanDigits = args[0].replace(/\D/g, '');
@@ -4335,7 +4367,17 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
                 }
 
                 const targetNum = targetJid.split('@')[0].replace(/\D/g, '');
-                const participant = groupMeta?.participants?.find((p: any) => p.id.replace(/\D/g, '') === targetNum);
+                const matchesTarget = (entry: any) =>
+                  [entry?.id, entry?.phoneNumber, entry?.lid]
+                    .filter((value: unknown): value is string => typeof value === 'string')
+                    .some((value: string) => {
+                      if (value === targetJid) return true;
+                      const clean = value.split('@')[0].split(':')[0].replace(/\D/g, '');
+                      return clean === targetNum ||
+                        this.getLidReverseMapping(clean) === targetNum ||
+                        this.getLidReverseMapping(targetNum) === clean;
+                    });
+                const participant = groupMeta?.participants?.find(matchesTarget);
 
                 if (!participant) {
                   reactError();
@@ -4352,11 +4394,31 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
                   return;
                 }
 
+                if (!this.isBotAdminInGroup(groupMeta)) {
+                  reactError();
+                  await sock.sendMessage(remoteJid, {
+                    text: '⛔ WhatsApp confirms the linked account is not a group admin. It cannot promote members.',
+                  }, { quoted: msg });
+                  return;
+                }
+
                 await sock.groupParticipantsUpdate(remoteJid, [participant.id], 'promote');
+                await new Promise((resolve) => setTimeout(resolve, 300));
+                const updatedMeta = await this.getCachedGroupMetadata(sock, remoteJid, true);
+                const confirmedParticipant = updatedMeta?.participants?.find(matchesTarget);
+                const isConfirmedAdmin = confirmedParticipant?.admin === 'admin' || confirmedParticipant?.admin === 'superadmin';
+                if (!isConfirmedAdmin) {
+                  reactError();
+                  await sock.sendMessage(remoteJid, {
+                    text: '⚠️ WhatsApp did not confirm that member became an admin. No successful promotion is reported; verify the linked account still has group admin permission.',
+                  }, { quoted: msg });
+                  return;
+                }
+
                 reactDone();
                 await sock.sendMessage(remoteJid, {
-                  text: `⭐ *[ADMIN PROMOTED]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🎉 *Congratulations:* @${targetNum}\n🛡️ Promoted to *Group Administrator* by @${senderNum}!\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n> ⚡ _SOLVATECH Group Administration_`,
-                  mentions: [participant.id, senderJid],
+                  text: `⭐ *[ADMIN STATUS VERIFIED]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🎉 @${targetNum} is now confirmed as a *Group Administrator* by WhatsApp.\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n> ⚡ _SOLVATECH Group Administration_`,
+                  mentions: [confirmedParticipant?.id || participant.id],
                 }, { quoted: msg });
               } catch (err: any) {
                 reactError();
@@ -4373,7 +4435,7 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
               if (!isGroup || !isAuthorizedAdmin) return;
 
               try {
-                const groupMeta = await this.getCachedGroupMetadata(sock, remoteJid);
+                const groupMeta = await this.getCachedGroupMetadata(sock, remoteJid, true);
                 let targetJid = mentionedJids[0] || quotedParticipant;
                 if (!targetJid && args[0]) {
                   const cleanDigits = args[0].replace(/\D/g, '');
@@ -4389,7 +4451,17 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
                 }
 
                 const targetNum = targetJid.split('@')[0].replace(/\D/g, '');
-                const participant = groupMeta?.participants?.find((p: any) => p.id.replace(/\D/g, '') === targetNum);
+                const matchesTarget = (entry: any) =>
+                  [entry?.id, entry?.phoneNumber, entry?.lid]
+                    .filter((value: unknown): value is string => typeof value === 'string')
+                    .some((value: string) => {
+                      if (value === targetJid) return true;
+                      const clean = value.split('@')[0].split(':')[0].replace(/\D/g, '');
+                      return clean === targetNum ||
+                        this.getLidReverseMapping(clean) === targetNum ||
+                        this.getLidReverseMapping(targetNum) === clean;
+                    });
+                const participant = groupMeta?.participants?.find(matchesTarget);
 
                 if (!participant) {
                   reactError();
@@ -4414,11 +4486,35 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
                   return;
                 }
 
+                if (!this.isBotAdminInGroup(groupMeta)) {
+                  reactError();
+                  await sock.sendMessage(remoteJid, {
+                    text: '⛔ WhatsApp confirms the linked account is not a group admin. It cannot demote members.',
+                  }, { quoted: msg });
+                  return;
+                }
+
                 await sock.groupParticipantsUpdate(remoteJid, [participant.id], 'demote');
+                await new Promise((resolve) => setTimeout(resolve, 300));
+                const updatedMeta = await this.getCachedGroupMetadata(sock, remoteJid, true);
+                const confirmedParticipant = updatedMeta?.participants?.find(matchesTarget);
+                if (
+                  !confirmedParticipant ||
+                  confirmedParticipant.admin === 'admin' ||
+                  confirmedParticipant.admin === 'superadmin'
+                ) {
+                  reactError();
+                  await sock.sendMessage(remoteJid, {
+                    text: confirmedParticipant
+                      ? '⚠️ WhatsApp still reports this member as an admin. No successful demotion is reported.'
+                      : '⚠️ WhatsApp could not verify this member’s current role. No successful demotion is reported.',
+                  }, { quoted: msg });
+                  return;
+                }
                 reactDone();
                 await sock.sendMessage(remoteJid, {
                   text: `🔻 *[ADMIN DEMOTED]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n👤 *Participant:* @${targetNum}\n⚠️ Demoted from Administrator back to regular member.\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n> ⚡ _SOLVATECH Group Administration_`,
-                  mentions: [participant.id],
+                  mentions: [confirmedParticipant?.id || participant.id],
                 }, { quoted: msg });
               } catch (err: any) {
                 reactError();
@@ -5739,10 +5835,15 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
 
   public async isBotAdminInGroupById(groupId: string): Promise<boolean> {
     const currentSock = this.sock;
-    if (!groupId || !currentSock || !this.currentStatus.isConnected) return false;
+    if (
+      !groupId?.endsWith('@g.us') ||
+      !currentSock ||
+      !this.currentStatus.isConnected ||
+      !this.isSocketActive()
+    ) return false;
     try {
-      const meta = await this.getCachedGroupMetadata(currentSock, groupId);
-      if (!meta) return false;
+      const meta = await this.getCachedGroupMetadata(currentSock, groupId, true);
+      if (!meta || currentSock !== this.sock || !this.isSocketActive()) return false;
       return this.isBotAdminInGroup(meta);
     } catch {
       return false;
@@ -5753,8 +5854,8 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
     const currentSock = this.sock;
     if (!groupId || !participantJid || !currentSock || !this.currentStatus.isConnected) return false;
     try {
-      const meta = await this.getCachedGroupMetadata(currentSock, groupId);
-      if (!meta) return false;
+      const meta = await this.getCachedGroupMetadata(currentSock, groupId, true);
+      if (!meta || currentSock !== this.sock || !this.isSocketActive()) return false;
       const targetId = participantJid.split('@')[0].split(':')[0].replace(/\D/g, '');
       const targetIds = new Set<string>();
       if (targetId) targetIds.add(targetId);
@@ -5858,6 +5959,7 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
     pictureUrl?: string | null;
     memberCount: number;
     isAdmin: boolean;
+    adminStatusVerified?: boolean;
     creation?: number;
     owner?: string;
     settings: {
@@ -5874,7 +5976,11 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
     let activeSock = this.sock;
     if (!activeSock || typeof activeSock.groupFetchAllParticipating !== 'function') {
       if (this.cachedGroups.length > 0 && this.hasRegisteredCredentials() && !this.isLicenseExpired()) {
-        return this.cachedGroups;
+        return this.cachedGroups.map((group) => ({
+          ...group,
+          isAdmin: false,
+          adminStatusVerified: false,
+        }));
       }
       return [];
     }
@@ -5903,7 +6009,13 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
         await new Promise((r) => setTimeout(r, 1000));
         activeSock = this.sock;
         if (!activeSock || typeof activeSock.groupFetchAllParticipating !== 'function') {
-          if (this.cachedGroups.length > 0) return this.cachedGroups;
+          if (this.cachedGroups.length > 0) {
+            return this.cachedGroups.map((group) => ({
+              ...group,
+              isAdmin: false,
+              adminStatusVerified: false,
+            }));
+          }
           return [];
         }
         allGroups = await Promise.race([
@@ -5913,8 +6025,14 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
       }
 
       if (!allGroups || typeof allGroups !== 'object') {
-        if (this.cachedGroups.length > 0) return this.cachedGroups;
-        return [];
+        if (this.cachedGroups.length > 0) {
+          return this.cachedGroups.map((group) => ({
+            ...group,
+            isAdmin: false,
+            adminStatusVerified: false,
+          }));
+        }
+        throw new Error('WhatsApp returned an invalid participating-group list.');
       }
 
       // Collect all possible identities of the linked account/user
@@ -6022,6 +6140,7 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
           pictureUrl: cachedPic,
           memberCount: meta.participants?.length || 0,
           isAdmin,
+          adminStatusVerified: true,
           creation: meta.creation,
           owner: meta.owner,
           settings: commandHandler.getSecuritySettings(gid, this.userId),
@@ -6044,15 +6163,17 @@ ${voItem.caption ? `📝 *Caption:* "${voItem.caption}"\n` : ''}━━━━━�
     } catch (err: any) {
       console.warn(`[Groups (${this.userId})] Error fetching live participating groups:`, err?.message || err);
       if (this.cachedGroups.length > 0) {
-        return this.cachedGroups;
+        return this.cachedGroups.map((group) => ({
+          ...group,
+          isAdmin: false,
+          adminStatusVerified: false,
+        }));
       }
-      return [];
+      throw err instanceof Error ? err : new Error('Failed to fetch participating WhatsApp groups.');
     }
 
-    if (result.length > 0) {
-      this.cachedGroups = result;
-      this.lastGroupFetchTime = Date.now();
-    }
+    this.cachedGroups = result;
+    this.lastGroupFetchTime = Date.now();
 
     return result;
   }

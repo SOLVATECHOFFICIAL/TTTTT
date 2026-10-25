@@ -44,6 +44,7 @@ export const GROUP_ONLY_COMMANDS = new Set([
   'unwarn',
   'clearwarns',
   'resetwarns',
+  'anti',
   'antilink',
   'antibot',
   'antistatus',
@@ -80,6 +81,7 @@ export const ADMIN_ONLY_GROUP_COMMANDS = new Set([
   'unwarn',
   'clearwarns',
   'resetwarns',
+  'anti',
   'antilink',
   'antibot',
   'antistatus',
@@ -185,7 +187,7 @@ export const SOLVATECH_MENU = `╭━━━〔 ⚡ *SOLVATECH BOT COMMAND DIRECT
 │ • *.demote @user* — _Demote group admin to member_
 │ • *.lock* — _Restrict group messaging to admins only_
 │ • *.unlock* — _Allow all members to send messages_
-│ • *.antilink on/off* — _Auto-remove external links_
+│ • *.anti on/off* or *.antilink on/off* — _Auto-remove external links_
 │ • *.antibot on/off* — _Auto-remove rogue automated bot accounts_
 │ • *.antistatus on/off* — _Auto-remove WhatsApp status group mentions_
 │ • *.autowelcome on/off* — _Auto-welcome new participants upon joining_
@@ -1510,15 +1512,25 @@ Message successfully pinned for 7 days by Group Admin!
       };
     }
 
-    if (cmd === 'antilink') {
+    if (cmd === 'antilink' || cmd === 'anti') {
       if (!ctx.isGroup) {
-        return { reply: `⚠️ *[GROUP ONLY]*\nThe *.antilink* command can only be used inside a WhatsApp group.` };
+        return { reply: `⚠️ *[GROUP ONLY]*\nThe *.anti* command can only be used inside a WhatsApp group.` };
       }
       if (!ctx.isOwner && !ctx.isGroupAdmin) {
         return { reply: `⛔ *[ACCESS DENIED]*\nOnly Group Administrators connected to the bot can configure group protection.` };
       }
-      const val = ctx.args[0]?.toLowerCase() === 'off' ? false : true;
       const gid = ctx.groupJid || 'default';
+      const requestedState = ctx.args[0]?.toLowerCase();
+      if (cmd === 'anti' && !requestedState) {
+        const enabled = this.getSecuritySettings(gid, ctx.securityScope).antilink;
+        return {
+          reply: `🛡️ *[ANTI-LINK STATUS]*\nAnti-Link is currently *${enabled ? 'ON' : 'OFF'}*.\nUse *.anti on* or *.anti off* to change it.`,
+        };
+      }
+      if (requestedState && requestedState !== 'on' && requestedState !== 'off') {
+        return { reply: `Usage: *.anti on* or *.anti off* (alias for *.antilink*).` };
+      }
+      const val = requestedState === 'off' ? false : true;
       await this.setSecuritySetting(gid, 'antilink', val, ctx.securityScope);
       return {
         reply: `🛡️ *[ANTI-LINK SYSTEM]*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\nStatus: ${val ? '✅ *ENABLED*' : '❌ *DISABLED*'}\nPolicy: Unauthorized external links will be auto-deleted with security warning issued to sender.\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚡ _SOLVATECH Group Defense_`,
