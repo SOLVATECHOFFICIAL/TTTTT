@@ -2275,12 +2275,12 @@ export class WhatsAppManager {
     const cached = this.groupMetaCache.get(gid);
     const hasParticipants = Array.isArray(cached?.meta?.participants) && cached.meta.participants.length > 0;
 
-    // Serve warm cache immediately (0ms) for up to 15 minutes; trigger background refresh if older than 2 minutes
-    if (!force && cached && hasParticipants && now - cached.timestamp < 15 * 60 * 1000) {
+    // 1. Warm memory cache hit (0ms)
+    if (!force && cached && hasParticipants) {
       if (now - cached.timestamp > 2 * 60 * 1000 && !this.groupMetaInFlight.has(gid) && sock?.groupMetadata) {
         const bgFetch = Promise.race([
           sock.groupMetadata(gid),
-          new Promise<null>((resolve) => setTimeout(() => resolve(null), 3500)),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
         ])
           .then((fresh) => {
             if (fresh && Array.isArray(fresh.participants) && fresh.participants.length > 0) {
@@ -2296,43 +2296,77 @@ export class WhatsAppManager {
       return cached.meta;
     }
 
-    if (!force && this.groupMetaInFlight.has(gid)) {
-      const inflight = await this.groupMetaInFlight.get(gid);
-      if (inflight) return inflight;
+    // 2. Disk cache hit (0ms)
+    const diskCached = this.cachedGroups.find((g) => g.id === gid);
+    if (!force && diskCached) {
+      const constructed = {
+        id: gid,
+        subject: diskCached.subject || this.groupSubjectCache.get(gid) || 'WhatsApp Group',
+        desc: diskCached.desc || '',
+        size: diskCached.memberCount || diskCached.size || 0,
+        participants: Array.isArray(diskCached.participants) ? diskCached.participants : [],
+      };
+      if (!this.groupMetaInFlight.has(gid) && sock?.groupMetadata) {
+        const bgFetch = Promise.race([
+          sock.groupMetadata(gid),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
+        ])
+          .then((fresh) => {
+            if (fresh && Array.isArray(fresh.participants) && fresh.participants.length > 0) {
+              this.cacheGroupMetaInstance(gid, fresh);
+            }
+          })
+          .catch(() => {})
+          .finally(() => {
+            this.groupMetaInFlight.delete(gid);
+          });
+        this.groupMetaInFlight.set(gid, bgFetch);
+      }
+      return constructed;
     }
 
-    const fetchPromise = (async () => {
-      try {
-        const meta = await Promise.race([
+    // 3. Fallback non-blocking (0ms) when force is false: kick off background fetch and return placeholder
+    if (!force) {
+      if (!this.groupMetaInFlight.has(gid) && sock?.groupMetadata) {
+        const bgFetch = Promise.race([
           sock.groupMetadata(gid),
-          new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error('groupMetadata timeout')), 2500)
-          ),
-        ]);
-        if (meta) {
-          this.cacheGroupMetaCacheWithDisk(gid, meta);
-        }
-        return meta;
-      } catch {
-        if (cached?.meta) return cached.meta;
-        const diskCached = this.cachedGroups.find((g) => g.id === gid);
-        if (diskCached) {
-          return {
-            id: gid,
-            subject: diskCached.subject || 'WhatsApp Group',
-            desc: diskCached.desc || '',
-            size: diskCached.memberCount || diskCached.size || 0,
-            participants: Array.isArray(diskCached.participants) ? diskCached.participants : [],
-          };
-        }
-        return null;
-      } finally {
-        this.groupMetaInFlight.delete(gid);
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
+        ])
+          .then((fresh) => {
+            if (fresh && Array.isArray(fresh.participants) && fresh.participants.length > 0) {
+              this.cacheGroupMetaInstance(gid, fresh);
+            }
+          })
+          .catch(() => {})
+          .finally(() => {
+            this.groupMetaInFlight.delete(gid);
+          });
+        this.groupMetaInFlight.set(gid, bgFetch);
       }
-    })();
+      return {
+        id: gid,
+        subject: this.groupSubjectCache.get(gid) || 'WhatsApp Group',
+        desc: '',
+        size: 0,
+        participants: [],
+      };
+    }
 
-    this.groupMetaInFlight.set(gid, fetchPromise);
-    return fetchPromise;
+    // 4. Force = true: synchronous fetch with timeout
+    try {
+      const meta = await Promise.race([
+        sock.groupMetadata(gid),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('groupMetadata timeout')), 2500)
+        ),
+      ]);
+      if (meta) {
+        this.cacheGroupMetaCacheWithDisk(gid, meta);
+      }
+      return meta;
+    } catch {
+      return cached?.meta || null;
+    }
   }
 
   private cacheGroupMetaCacheWithDisk(gid: string, meta: any) {
@@ -4113,10 +4147,6 @@ export class WhatsAppManager {
                     }
 
                     try {
-                      // Pre-warm group metadata into cache before sending to group so Baileys never stalls on groupMetadata
-                      if (jid.endsWith('@g.us') && !self.groupMetaCache.has(jid)) {
-                        await self.getCachedGroupMetadata(target, jid, false).catch(() => {});
-                      }
                       const sentResult = await Promise.race([
                         target.sendMessage(jid, content, normalizedOptions),
                         new Promise<never>((_, reject) =>
@@ -4270,29 +4300,34 @@ export class WhatsAppManager {
                 });
               }
 
-              // Smart reaction indicators: only send ⚡ if command takes >350ms so fast commands never collide with group reply encryption!
+              // Smart reaction indicators: omitted in group chats to prevent Signal sender-key ratchet race drops!
               const clearWorkingTimer = () => {
                 if (reactWorkingTimer) {
                   clearTimeout(reactWorkingTimer);
                   reactWorkingTimer = null;
                 }
               };
-              reactWorkingTimer = setTimeout(() => {
-                reactWorkingTimer = null;
-                sock.sendMessage(remoteJid, { react: { text: '⚡', key: msg.key } }).catch(() => {});
-              }, 350);
+              if (!isGroup) {
+                reactWorkingTimer = setTimeout(() => {
+                  reactWorkingTimer = null;
+                  sock.sendMessage(remoteJid, { react: { text: '⚡', key: msg.key } }).catch(() => {});
+                }, 350);
+              }
 
               const reactDone = () => {
                 clearWorkingTimer();
+                if (isGroup) return Promise.resolve(undefined);
                 return sock.sendMessage(remoteJid, { react: { text: '✅', key: msg.key } }).catch(() => {});
               };
               const reactError = () => {
                 clearWorkingTimer();
                 cmdLogStatus = 'error';
+                if (isGroup) return Promise.resolve(undefined);
                 return sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } }).catch(() => {});
               };
               const reactClear = () => {
                 clearWorkingTimer();
+                if (isGroup) return Promise.resolve(undefined);
                 return sock.sendMessage(remoteJid, { react: { text: '', key: msg.key } }).catch(() => {});
               };
 
